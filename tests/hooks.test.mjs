@@ -207,6 +207,25 @@ test('test marker detection catches markers anywhere in the user turn', () => {
   assert.equal(isMarkedTestTurn('Discuss [TEST-example] syntax'), true);
 });
 
+test('session context exposes the same context through Claude and generic hook fields', async () => {
+  const fake = await startFakeEvermem();
+  try {
+    const result = await runHook('session-context.js', {
+      session_id: 'session-context-test', cwd: pluginRoot, source: 'startup',
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(makeTempDir(), 'sessions.jsonl'),
+    });
+
+    assert.match(result.systemPrompt, /Session memory from a previous run/);
+    assert.equal(result.additionalContext, result.systemPrompt);
+  } finally {
+    await fake.close();
+  }
+});
+
 test('store hook uses the canonical transcript even when a Prime message snapshot is empty', async () => {
   const fake = await startFakeEvermem();
   const directory = makeTempDir();

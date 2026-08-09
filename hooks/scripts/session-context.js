@@ -199,7 +199,8 @@ async function main() {
     console.log(JSON.stringify({
       continue: true,
       systemMessage: displayOutput,
-      systemPrompt: contextMessage
+      systemPrompt: contextMessage,
+      additionalContext: contextMessage
     }));
 
   } catch (error) {
