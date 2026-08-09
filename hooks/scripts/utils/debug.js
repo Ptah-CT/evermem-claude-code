@@ -6,14 +6,12 @@
  *   setDebugPrefix('inject');  // Optional: add prefix to log lines
  *   debug('hookInput:', data);
  *
- * Enable by setting EVERMEM_DEBUG=1 in .env file or environment
- * Logs are written to /tmp/evermem-debug.log
+ * Enable by setting EVERMEM_DEBUG=1 in .env file or environment.
+ * Debug output is written to stderr so the invoking runtime can forward it to
+ * its normal journal/logging pipeline.
  */
 
-import { appendFileSync } from 'fs';
-import { isConfigured } from './config.js';  // This loads .env
-
-const DEBUG_LOG_PATH = '/tmp/evermem-debug.log';
+import './config.js';  // Loads the plugin .env before reading EVERMEM_DEBUG.
 
 // Check debug flag (after config.js loads .env)
 const DEBUG = process.env.EVERMEM_DEBUG === '1';
@@ -30,8 +28,7 @@ export function setDebugPrefix(prefix) {
 }
 
 /**
- * Write debug message to log file
- * Only writes when EVERMEM_DEBUG=1
+ * Write a debug message to stderr when EVERMEM_DEBUG=1.
  *
  * @param {...any} args - Arguments to log (objects are JSON stringified)
  */
@@ -45,11 +42,7 @@ export function debug(...args) {
   const timestamp = new Date().toISOString();
   const line = `[${timestamp}] ${debugPrefix}${msg}\n`;
 
-  try {
-    appendFileSync(DEBUG_LOG_PATH, line);
-  } catch (e) {
-    // Silent on write errors
-  }
+  process.stderr.write(line);
 }
 
 /**

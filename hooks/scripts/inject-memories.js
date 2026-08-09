@@ -8,7 +8,7 @@
  *
  * Flow:
  * 1. Read prompt from stdin
- * 2. Skip if prompt is too short or API not configured
+ * 2. Skip only prompts too short to search; configuration errors fail loudly
  * 3. Search EverMem Cloud for relevant memories
  * 4. Optionally filter with Claude SDK
  * 5. Display summary to user (via systemMessage)
@@ -79,29 +79,41 @@ async function main() {
       process.exit(0);
     }
 
-    // Skip if not configured (silent - don't nag users)
     if (!isConfigured()) {
-      debug('skipped: not configured');
-      process.exit(0);
+      throw new Error('EverMem endpoint, user identity, or request deadline not configured');
     }
 
-    // Search memories from EverMem Cloud
+    // Search memories from EverMem Cloud.
+    // A failing search is NEVER swallowed: a silent exit is indistinguishable from
+    // "no relevant memories", which is exactly how a dead recall path stays dead for
+    // weeks. Failures are reported in-band to both the user and the model below.
     let memories = [];
     let apiResponse = null;
+    const startedAt = Date.now();
     try {
       debug('searching memories for prompt:', prompt.slice(0, 100) + (prompt.length > 100 ? '...' : ''));
       apiResponse = await searchMemories(prompt, {
         topK: 15,
         retrieveMethod: 'hybrid'
       });
-      memories = transformSearchResults(apiResponse);
-      debug("memories:", memories);
-      debug('search results:', { total: memories.length, memories: memories.map(m => ({ score: m.score, subject: m.subject })) });
     } catch (error) {
-      // Silent on API errors - don't block user workflow
       debug('search error:', error.message);
-      process.exit(0);
+      reportFailure(error.message, Date.now() - startedAt);
     }
+
+    // searchMemories reports transport/HTTP failures as a _debug envelope instead of
+    // throwing; without this check they degrade into an empty result set.
+    const apiError = apiResponse?._debug?.error;
+    if (apiError !== undefined) {
+      const detail = typeof apiError === 'string' ? apiError : JSON.stringify(apiError);
+      const status = apiResponse._debug.status;
+      debug('search failed:', { status, detail });
+      reportFailure(status ? `HTTP ${status}: ${detail}` : detail, Date.now() - startedAt);
+    }
+
+    memories = transformSearchResults(apiResponse);
+    debug("memories:", memories);
+    debug('search results:', { total: memories.length, memories: memories.map(m => ({ score: m.score, subject: m.subject })) });
 
     // Filter by minimum score threshold
     const relevantMemories = memories.filter(m => m.score >= MIN_SCORE);
@@ -137,10 +149,40 @@ async function main() {
     process.exit(0);
 
   } catch (error) {
-    // Silent on errors - don't block user workflow
+    // Unexpected failure (bad hook input, broken module, ...). Still non-blocking,
+    // but never silent — a hook that dies quietly is a hook nobody repairs.
     debug('error:', error.message);
-    process.exit(0);
+    reportFailure(`${error.name}: ${error.message}`, 0);
   }
+}
+
+/**
+ * Report a failed memory recall in-band and terminate the hook.
+ *
+ * Both channels are used on purpose:
+ *   - systemMessage      so the operator sees that recall is broken, right now
+ *   - additionalContext  so the model knows the absence of memories is a failure,
+ *                        not evidence that nothing relevant exists
+ *
+ * @param {string} reason - Concrete failure reason (timeout, HTTP status, transport error)
+ * @param {number} elapsedMs - Time spent before failing
+ * @returns {never}
+ */
+function reportFailure(reason, elapsedMs) {
+  // Carry wall-clock start/end, not just a duration: that makes "it fired earlier than
+  // it claims" checkable against the EverCore journal instead of a matter of feel.
+  const endedAt = new Date();
+  const startedAt = new Date(endedAt.getTime() - elapsedMs);
+  const line = `‼️ EverMem recall FAILED — ${reason} `
+    + `(${startedAt.toISOString()} → ${endedAt.toISOString()}, ${(elapsedMs / 1000).toFixed(1)}s)`;
+  process.stdout.write(JSON.stringify({
+    systemMessage: line,
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: `<memory-recall-failed>\n${line}\nNo memories could be retrieved for this prompt. Do not treat this as "no relevant memories exist" — the recall path itself is broken.\n</memory-recall-failed>`
+    }
+  }));
+  process.exit(0);
 }
 
 /**

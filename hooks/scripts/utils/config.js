@@ -27,10 +27,12 @@ if (existsSync(envPath)) {
   }
 }
 
-const API_BASE_URL = 'https://api.evermind.ai';
+// Self-hosted deployments must provide EVERMEM_API_URL explicitly.
+const API_BASE_URL = null;
 
 /**
- * Get the EverMem API key from environment
+ * Get the EverMem API key from environment.
+ * Self-hosted EverMemOS does not require an API key; kept for upstream compat.
  * @returns {string|null} API key or null if not set
  */
 export function getApiKey() {
@@ -38,12 +40,11 @@ export function getApiKey() {
 }
 
 /**
- * Get the user ID for memory operations
- * Defaults to 'claude-code-user' if not set
- * @returns {string} User ID
+ * Get the user ID for memory operations.
+ * @returns {string|null} User ID or null when unconfigured
  */
 export function getUserId() {
-  return process.env.EVERMEM_USER_ID || 'claude-code-user';
+  return process.env.EVERMEM_USER_ID || null;
 }
 
 /**
@@ -55,6 +56,12 @@ export function getUserId() {
 export function getGroupId() {
   if (process.env.EVERMEM_GROUP_ID) {
     return process.env.EVERMEM_GROUP_ID;
+  }
+  // xinfty: disable per-project (cwd-derived) scoping so memory is shared across
+  // ALL projects and git worktrees. Returning null makes search/store fall back
+  // to user_id scope (the full user pool) instead of an isolated cwd group.
+  if (process.env.EVERMEM_DISABLE_PROJECT_SCOPE === '1') {
+    return null;
   }
   // Use EVERMEM_CWD (set from hook input) or fall back to process.cwd()
   const cwd = process.env.EVERMEM_CWD || process.cwd();
@@ -73,18 +80,34 @@ export function getGroupId() {
 
 /**
  * Get the API base URL
- * @returns {string} Base URL
+ * @returns {string|null} Base URL or null when unconfigured
  */
 export function getApiBaseUrl() {
   return process.env.EVERMEM_API_URL || API_BASE_URL;
 }
 
 /**
- * Check if the plugin is properly configured
- * @returns {boolean} True if API key is set
+ * Get the deployment-owned request deadline.
+ * This must reflect the real EverMem service processing bound; there is no
+ * hard-coded fallback because an invented default either hangs or kills valid work.
+ * @returns {number|null} Deadline in milliseconds or null when unconfigured
+ */
+export function getRequestTimeoutMs() {
+  const raw = process.env.EVERMEM_REQUEST_TIMEOUT_MS;
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error('EVERMEM_REQUEST_TIMEOUT_MS must be a positive integer');
+  }
+  return value;
+}
+
+/**
+ * Check if the self-hosted EverMem endpoint, user identity, and request deadline are configured.
+ * @returns {boolean}
  */
 export function isConfigured() {
-  return !!getApiKey();
+  return !!getApiBaseUrl() && !!getUserId() && !!getRequestTimeoutMs();
 }
 
 /**
@@ -111,6 +134,7 @@ export function getConfig() {
     userId: getUserId(),
     groupId: getGroupId(),
     apiBaseUrl: getApiBaseUrl(),
+    requestTimeoutMs: getRequestTimeoutMs(),
     isConfigured: isConfigured()
   };
 }

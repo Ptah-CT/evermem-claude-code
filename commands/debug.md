@@ -1,59 +1,24 @@
 ---
-description: View EverMem debug logs to troubleshoot memory saving and retrieval issues
+description: Explain and inspect EverMem hook diagnostics
 ---
 
-# EverMem Debug Log Viewer
+# EverMem Diagnostics
 
-View the EverMem debug log to troubleshoot issues.
+EverMem emits debug diagnostics to stderr. It deliberately does not write a
+shared file under `/tmp`: concurrent hooks would mix records, and host logging
+already captures stderr.
 
 ## Instructions
 
-Show the user the recent debug log entries from `/tmp/evermem-debug.log`.
+1. Check whether `EVERMEM_DEBUG=1` is set in the plugin `.env`.
+2. Explain that hook errors are always emitted to stderr, while verbose debug
+   lines require `EVERMEM_DEBUG=1`.
+3. Inspect the stderr/journal surface used by the current host (Claude Code or
+   Prime Agent). On xinfty, query the relevant service logs through Loki first.
+4. Filter for the stable prefixes `[inject]`, `[store]`, `[session-start]`,
+   `[session-end]`, and `[EverMemAPI]`.
+5. Report the exact failing request or parser error. Do not create a fallback
+   debug file and do not hide a failure behind retries.
 
-1. First check if debug mode is enabled by looking for `EVERMEM_DEBUG=1` in the plugin's `.env` file
-2. Read the last 50 lines of the debug log file
-3. If the file doesn't exist or is empty, inform the user how to enable debug mode
-
-## Actions
-
-1. Check debug mode status:
-   ```bash
-   grep "EVERMEM_DEBUG" /path/to/plugin/.env 2>/dev/null || echo "Not configured"
-   ```
-
-2. Show recent logs:
-   ```bash
-   tail -50 /tmp/evermem-debug.log 2>/dev/null || echo "No debug log found"
-   ```
-
-3. Format the output for the user, highlighting:
-   - `[inject]` entries for memory retrieval
-   - `[store]` entries for memory saving
-   - Any errors or warnings
-
-## Output Format
-
-```
-📋 EverMem Debug Log
-
-Status: Debug mode [ENABLED/DISABLED]
-Log file: /tmp/evermem-debug.log
-
---- Recent Entries ---
-[timestamp] [inject] ...
-[timestamp] [store] ...
-
---- Tips ---
-• Enable debug: Add EVERMEM_DEBUG=1 to .env
-• Clear log: > /tmp/evermem-debug.log
-• Live view: tail -f /tmp/evermem-debug.log
-```
-
-## Additional Options
-
-If the user specifies arguments:
-- `clear` - Clear the debug log
-- `live` - Show command for live monitoring
-- `full` - Show more lines (100+)
-- `inject` - Filter to show only [inject] entries
-- `store` - Filter to show only [store] entries
+If the user asks to clear logs, explain that retention is owned by the host log
+system rather than this plugin.

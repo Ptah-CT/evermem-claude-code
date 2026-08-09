@@ -2,199 +2,119 @@
 
 /**
  * EverMem SessionEnd Hook
- * Saves session summary (first user prompt + stats) to local storage
- * No AI summarization - just extracts key info from transcript
+ * Saves a local session summary without invoking an AI model.
  */
 
-import { readFileSync, appendFileSync, existsSync } from 'fs';
+import { appendFileSync, readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getGroupId, getConfig } from './utils/config.js';
 import { debug, setDebugPrefix } from './utils/debug.js';
+import { extractSessionStats, getCanonicalSessionId, isMarkedTestTurn, parseTranscript } from './utils/transcript.js';
 
 setDebugPrefix('session-end');
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SESSIONS_FILE = resolve(__dirname, '../../data/sessions.jsonl');
+const SESSIONS_FILE = process.env.EVERMEM_SESSIONS_FILE
+  || resolve(__dirname, '../../data/sessions.jsonl');
 
-/**
- * Read transcript and extract key content
- * @param {string} transcriptPath - Path to the transcript JSONL file
- * @returns {Object|null} Extracted content
- */
-function extractTranscriptContent(transcriptPath) {
-  try {
-    if (!existsSync(transcriptPath)) {
-      return null;
-    }
-
-    const content = readFileSync(transcriptPath, 'utf8');
-    const lines = content.trim().split('\n').filter(Boolean);
-
-    let firstUserPrompt = null;
-    let lastUserPrompt = null;
-    let turnCount = 0;
-    let firstTimestamp = null;
-    let lastTimestamp = null;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-
-        // Track timestamps
-        if (entry.timestamp) {
-          if (!firstTimestamp) firstTimestamp = entry.timestamp;
-          lastTimestamp = entry.timestamp;
-        }
-
-        // Count turns
-        if (entry.type === 'system' && entry.subtype === 'turn_duration') {
-          turnCount++;
-        }
-
-        // Extract user messages (not tool_result)
-        if (entry.type === 'user' && entry.message?.role === 'user') {
-          const msgContent = entry.message.content;
-          if (typeof msgContent === 'string' && msgContent.trim()) {
-            if (!firstUserPrompt) {
-              firstUserPrompt = msgContent.trim();
-            }
-            lastUserPrompt = msgContent.trim();
-          }
-        }
-      } catch {}
-    }
-
-    return {
-      firstUserPrompt: firstUserPrompt?.substring(0, 200) || '',
-      lastUserPrompt: lastUserPrompt?.substring(0, 200) || '',
-      turnCount,
-      firstTimestamp,
-      lastTimestamp
-    };
-  } catch {
-    return null;
-  }
+function writeMessage(systemMessage) {
+  process.stdout.write(JSON.stringify({ systemMessage }));
 }
 
-/**
- * Save session summary to local JSONL file
- */
-function saveSummary(entry) {
-  try {
-    appendFileSync(SESSIONS_FILE, JSON.stringify(entry) + '\n', 'utf8');
-    return true;
-  } catch {
-    return false;
-  }
+function reportFailure(error) {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  writeMessage(`⚠️ EverMem SessionEnd failed: ${detail}`);
 }
 
-/**
- * Check if session already has a summary
- */
-function alreadySummarized(sessionId) {
-  try {
-    if (!existsSync(SESSIONS_FILE)) {
-      return false;
-    }
-    const content = readFileSync(SESSIONS_FILE, 'utf8');
-    return content.includes(`"sessionId":"${sessionId}"`);
-  } catch {
-    return false;
+function appendSummary(entry) {
+  // A single append preserves concurrent SessionEnd records. Readers scan from the
+  // end, so a repeated shutdown naturally supersedes an older record for a session.
+  appendFileSync(SESSIONS_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+function formatDuration(firstTimestamp, lastTimestamp) {
+  if (!firstTimestamp || !lastTimestamp) {
+    return '';
   }
+
+  const durationMs = new Date(lastTimestamp).getTime() - new Date(firstTimestamp).getTime();
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return '';
+  }
+
+  const minutes = Math.floor(durationMs / 60000);
+  if (minutes < 1) return '<1min';
+  if (minutes < 60) return `${minutes}min`;
+
+  const hours = Math.floor(minutes / 60);
+  const remainMins = minutes % 60;
+  return remainMins > 0 ? `${hours}h${remainMins}m` : `${hours}h`;
+}
+
+async function readHookInput() {
+  let input = '';
+  for await (const chunk of process.stdin) {
+    input += chunk;
+  }
+  return input ? JSON.parse(input) : {};
 }
 
 async function main() {
-  // Read hook input
-  let hookInput = {};
-  try {
-    let input = '';
-    for await (const chunk of process.stdin) {
-      input += chunk;
-    }
-    if (input) {
-      hookInput = JSON.parse(input);
-    }
-  } catch {
-    process.exit(0);
+  const hookInput = await readHookInput();
+  const fallbackSessionId = hookInput.session_id || hookInput.sessionId;
+  const transcriptPath = hookInput.transcript_path || hookInput.transcriptPath;
+
+  if (hookInput.cwd) {
+    process.env.EVERMEM_CWD = hookInput.cwd;
+  }
+  if (!getConfig().isConfigured) {
+    throw new Error('EverMem is not configured');
+  }
+  if (!fallbackSessionId) {
+    throw new Error('Missing session_id');
+  }
+  if (!transcriptPath) {
+    throw new Error('Missing transcript_path');
+  }
+  if (!existsSync(transcriptPath)) {
+    throw new Error(`Transcript not found: ${transcriptPath}`);
   }
 
-  const { session_id, transcript_path, cwd, reason } = hookInput;
+  const entries = parseTranscript(readFileSync(transcriptPath, 'utf8'));
+  const sessionId = getCanonicalSessionId(entries, fallbackSessionId);
+  const content = extractSessionStats(entries);
+  debug('extracted session:', content);
 
-  // Skip if no transcript or already summarized
-  if (!transcript_path || !session_id) {
-    process.exit(0);
+  if (content.turnCount === 0) {
+    writeMessage('⏭️ EverMem: Session has no user turns; summary skipped');
+    return;
+  }
+  if (isMarkedTestTurn(content.firstUserPrompt)) {
+    writeMessage('🧪 EverMem: Test session detected; summary skipped');
+    return;
   }
 
-  const wasAlreadySummarized = alreadySummarized(session_id);
-
-  // Set cwd for config
-  if (cwd) {
-    process.env.EVERMEM_CWD = cwd;
-  }
-
-  const config = getConfig();
-  if (!config.isConfigured) {
-    process.exit(0);
-  }
-
-  // Extract content from transcript
-  const content = extractTranscriptContent(transcript_path);
-  if (!content || content.turnCount === 0) {
-    process.exit(0);
-  }
-
-  // Use first user prompt as summary (truncated)
   const summary = content.firstUserPrompt || 'Session with no text prompts';
-
-  // Calculate session duration
-  let durationStr = '';
-  if (content.firstTimestamp && content.lastTimestamp) {
-    const durationMs = new Date(content.lastTimestamp) - new Date(content.firstTimestamp);
-    const minutes = Math.floor(durationMs / 60000);
-    if (minutes < 1) {
-      durationStr = '<1min';
-    } else if (minutes < 60) {
-      durationStr = `${minutes}min`;
-    } else {
-      const hours = Math.floor(minutes / 60);
-      const remainMins = minutes % 60;
-      durationStr = remainMins > 0 ? `${hours}h${remainMins}m` : `${hours}h`;
-    }
-  }
-
-  // Truncate summary for display
-  const displaySummary = summary.length > 50
-    ? summary.substring(0, 50) + '...'
-    : summary;
-
-  // Build output: turns, duration, summary
+  const durationStr = formatDuration(content.firstTimestamp, content.lastTimestamp);
+  const displaySummary = summary.length > 50 ? summary.substring(0, 50) + '...' : summary;
   const parts = [`${content.turnCount} turns`];
   if (durationStr) parts.push(durationStr);
 
-  // Save to local file (only if not already saved)
-  if (!wasAlreadySummarized) {
-    const entry = {
-      sessionId: session_id,
-      groupId: getGroupId(),
-      summary,
-      turnCount: content.turnCount,
-      reason: reason || 'unknown',
-      startTime: content.firstTimestamp,
-      endTime: content.lastTimestamp,
-      timestamp: new Date().toISOString()
-    };
-    saveSummary(entry);
-  }
+  appendSummary({
+    sessionId,
+    groupId: getGroupId(),
+    summary,
+    turnCount: content.turnCount,
+    reason: hookInput.reason || 'unknown',
+    startTime: content.firstTimestamp,
+    endTime: content.lastTimestamp,
+    timestamp: new Date().toISOString()
+  });
 
-  // Always output session summary (whether saved or not)
   const message = `📝 Session (${parts.join(', ')}): "${displaySummary}"`;
-
-  // Log to unified debug file
   debug('output', message);
-
-  console.error(message);  // Direct terminal output
-  console.log(JSON.stringify({ systemMessage: message }));
+  writeMessage(message);
 }
 
-main().catch(() => process.exit(0));
+main().catch(reportFailure);

@@ -12,7 +12,26 @@ Persistent memory for Claude Code. Automatically saves and recalls context from 
 - **Memory Search** - Manually search your memory history
 - **Memory Hub** - Visual dashboard to explore and manage memories
 
-## Quick Install
+## Ptah-CT self-hosted fork
+
+This branch carries the xinfty self-hosted integration for both Claude Code and
+Prime Agent. It does not contain credentials or an environment-specific endpoint.
+Copy `.env.example` to `.env` and set `EVERMEM_API_URL`, `EVERMEM_USER_ID`, and
+a request deadline derived from the deployed EverMemOS processing bound.
+
+Claude Code loads the hooks from `hooks/hooks.json`. Prime Agent loads the
+versioned extension from `prime/evermem.ts`; symlink that file into your Prime
+extensions directory. The extension resolves this repository through the symlink
+target, so the checked-out `prime/` and `hooks/` directories stay together.
+
+Debug diagnostics are written to stderr for capture by the host process and its
+journal; no `/tmp` debug file is created.
+
+## Upstream installation reference
+
+The following is the original EverMind cloud workflow. It is retained as upstream
+reference, but it does not configure this self-hosted branch; use `.env.example`
+above for this fork.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/EverMind-AI/evermem-claude-code/main/install.sh | bash
@@ -124,7 +143,11 @@ To use the hub, run `/evermem:hub` and follow the instructions.
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `EVERMEM_API_KEY` | Your EverMem API key | Yes |
+| `EVERMEM_API_URL` | Base URL of the self-hosted EverMemOS service | Yes |
+| `EVERMEM_USER_ID` | Stable user identity used for memory ownership | Yes |
+| `EVERMEM_REQUEST_TIMEOUT_MS` | Request deadline derived from the deployed service processing bound | Yes |
+| `EVERMEM_DISABLE_PROJECT_SCOPE` | Set to `1` to use the full user pool instead of per-project groups | No |
+| `EVERMEM_API_KEY` | Bearer credential for deployments that require authentication | No |
 
 ### Project-Specific Settings
 
@@ -140,15 +163,15 @@ Project-specific notes here.
 
 ## Troubleshooting
 
-### API Key Not Configured
+### Self-hosted configuration missing
+
+Copy `.env.example` to `.env` and set the endpoint, stable user identity, and a
+request deadline derived from the real EverMemOS processing limit. Hooks fail loudly
+when this contract is absent or invalid.
 
 ```bash
-# Check if the key is set
-echo $EVERMEM_API_KEY
-
-# If empty, add to your shell profile and reload
-export EVERMEM_API_KEY="your-key-here"
-source ~/.zshrc
+cp .env.example .env
+# Edit EVERMEM_API_URL, EVERMEM_USER_ID, and EVERMEM_REQUEST_TIMEOUT_MS.
 ```
 
 ### No Memories Found
@@ -164,20 +187,10 @@ source ~/.zshrc
 
 ### Debug Mode
 
-Enable debug logging to troubleshoot issues:
-
-```bash
-# Set environment variable
-export EVERMEM_DEBUG=1
-
-# View logs in real-time
-tail -f /tmp/evermem-debug.log
-
-# Clear logs
-> /tmp/evermem-debug.log
-```
-
-Run `/evermem:debug` to view recent debug logs directly.
+Set `EVERMEM_DEBUG=1` to emit verbose diagnostics. Hook errors are always emitted.
+All diagnostics go to stderr so Claude Code or Prime Agent can capture them in its
+normal log/journal surface; the plugin does not create a shared `/tmp` log file.
+Run `/evermem:debug` for host-specific inspection guidance.
 
 ## Links
 
@@ -345,9 +358,9 @@ The SessionStart hook runs when Claude Code starts a new session. It loads recen
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Claude Code Session Start                     │
 │                                                                  │
-│  1. Claude Code spawns: session-context-wrapper.sh              │
-│  2. Wrapper checks npm dependencies                              │
-│  3. Wrapper executes: node session-context.js                   │
+│  1. Claude Code executes: node session-context.js              │
+│  2. The script validates configuration and reads the transcript │
+│  3. Errors are returned explicitly through hook output/stderr   │
 └─────────────────────────────────────────────────────────────────┘
                                │
                                ▼
@@ -415,13 +428,14 @@ No AI summarization is used - pure local data extraction for zero latency and no
 
 | Error Type | User Message |
 |------------|--------------|
-| Network error | "Cannot reach EverMem server. Check your internet connection." |
-| Timeout | "EverMem server is slow or unreachable." |
-| 401/Unauthorized | "Authentication failed. Check your EVERMEM_API_KEY." |
-| 404 | "API endpoint not found. Check EVERMEM_BASE_URL." |
-| Module not found | "Missing dependency. Run: npm install" |
+| Network error | Cannot reach the configured EverMem endpoint |
+| Request deadline | Request aborted at the configured deployment deadline |
+| 401/Unauthorized | Check `EVERMEM_API_KEY` if this deployment requires authentication |
+| 404 | Check `EVERMEM_API_URL` |
+| Invalid configuration | Endpoint, user identity, and request deadline are required |
 
-All errors return `continue: true` to ensure session starts normally.
+SessionStart reports errors in `systemMessage` and stderr while returning `continue: true`;
+it never turns a broken memory path into an apparently empty result.
 
 ### Node.js Version Check
 
@@ -519,9 +533,11 @@ Each session is saved as a single line in `data/sessions.jsonl`:
 | `endTime` | Last message timestamp |
 | `timestamp` | When summary was saved |
 
-### Deduplication
+### Concurrent-safe append log
 
-Each session is only saved once. Before saving, the hook checks if the sessionId already exists in `sessions.jsonl`.
+Each SessionEnd appends one JSONL record atomically. Repeated shutdown events may append
+newer records for the same `sessionId`; readers scan from the end, so the newest record
+wins. This avoids the lost-update race of read/filter/rewrite when sessions end concurrently.
 
 ### No AI Summarization
 
@@ -685,75 +701,25 @@ System Events (hooks, timing)
 
 ### Turn Boundary & Segmentation
 
-**Session Level:** One JSONL file = One Session (filename is session ID)
+**Session level:** one persisted JSONL file is the canonical source for one session.
+The hook never prefers an in-memory event snapshot over `transcript_path`.
 
-**Turn Level:** A "Turn" = User sends message → Claude fully responds
+**Claude Code:** visible user and assistant text is accumulated in file order. A
+`system/turn_duration` record closes a turn when present; the final accumulated turn is
+also accepted at end of file because the Stop hook may run before that marker is appended.
+There is no polling or retry loop.
 
-**Turn boundary marker (ONLY this one):**
-```json
-{"type":"system","subtype":"turn_duration","durationMs":30692}
-```
-
-> **Note:** `file-history-snapshot` is NOT a turn boundary. It's a session-level marker that can appear anywhere in the file.
-
-**JSONL Structure:**
-```
-Line 1:      file-history-snapshot  ← Session marker (NOT turn boundary)
-Line 2-21:   Turn 1
-Line 22:     turn_duration          ← Turn 1 end ✓
-Line 23:     file-history-snapshot  ← Can appear mid-session (NOT turn boundary)
-Line 24-43:  Turn 2
-Line 44:     turn_duration          ← Turn 2 end ✓
-...
-```
-
-**Message Chain (parentUuid):**
-```
-user (uuid: aaa, parent: None)     ← Turn start
-  ↓
-assistant/thinking (parent: aaa)
-  ↓
-assistant/tool_use (parent: ...)
-  ↓
-user/tool_result (parent: ...)     ← NOT user input, skip!
-  ↓
-assistant/text (parent: ...)       ← Final response
-  ↓
-system/turn_duration (parent: ...) ← Turn end
-```
+**Prime Agent:** entries on the active `id`/`parentId` branch are normalized. User input
+starts or extends the current turn; assistant `stopReason: stop|length` closes it
+successfully. `error|aborted` closes it as failed, so a failed latest turn cannot cause the
+previous successful turn to be uploaded again.
 
 ### Memory Extraction
 
-The `store-memories.js` hook extracts the **last complete Turn**:
-
-1. **Wait for completion** - Retry reading file until `turn_duration` marker appears (indicates turn is complete)
-2. **Find turn boundaries** - Start after last `turn_duration`, end at current `turn_duration`
-   - **ONLY** `turn_duration` is used as boundary (NOT `file-history-snapshot`)
-3. **Collect user text** - Original input only (skip `tool_result`)
-4. **Collect assistant text** - All `text` blocks (skip `thinking`, `tool_use`)
-5. **Merge content** - Join scattered text blocks with `\n\n` separator
-6. **Upload to cloud** - Send both user and assistant content to EverMem API
-
-**Race Condition Handling:**
-
-The Stop hook runs before `turn_duration` is written. To ensure complete content extraction:
-
-```javascript
-// Retry until turn_duration appears (max 5 attempts, 100ms delay)
-async function readTranscriptWithRetry(path) {
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    const lines = readFile(path);
-    const lastLine = JSON.parse(lines[lines.length - 1]);
-
-    // turn_duration = turn complete
-    if (lastLine.type === 'system' && lastLine.subtype === 'turn_duration') {
-      return lines;
-    }
-
-    await sleep(100);  // Wait and retry
-  }
-}
-```
+`store-memories.js` parses the canonical transcript once, selects the latest successful
+completed turn, excludes thinking/tool content, and uploads deterministic USER and
+ASSISTANT records. Missing, malformed, failed, or incomplete input is reported explicitly;
+no `turn_duration` retry logic or alternate `prime_messages` source exists.
 
 **Why merge?** A single Claude response spans multiple JSONL lines:
 - `thinking` → `tool_use` → `tool_result` → ... → `text` (final response)
@@ -981,15 +947,11 @@ debug('hookInput:', data); // Only writes when EVERMEM_DEBUG=1
 # Memory storage (Stop hook)
 [2026-02-06T08:47:36.184Z] [store] hookInput: { "transcript_path": "...jsonl", ... }
 
-# Retry logic - waiting for turn_duration
-[2026-02-06T08:47:36.200Z] [store] read attempt 1: { "totalLines": 525, "isComplete": false, "lastLineType": "progress" }
-[2026-02-06T08:47:36.201Z] [store] turn not complete, waiting 100ms before retry...
-[2026-02-06T08:47:36.310Z] [store] read attempt 2: { "totalLines": 527, "isComplete": false, "lastLineType": "system/stop_hook_summary" }
-[2026-02-06T08:47:36.311Z] [store] turn not complete, waiting 100ms before retry...
-[2026-02-06T08:47:36.420Z] [store] read attempt 3: { "totalLines": 528, "isComplete": true, "lastLineType": "system/turn_duration" }
+# Canonical transcript extraction (single read, no polling)
+[2026-02-06T08:47:36.200Z] [store] canonical transcript parsed: { "format": "claude", "completedTurns": 4 }
 
 # Content extraction
-[2026-02-06T08:47:36.425Z] [store] turn range: { "turnStartIndex": 500, "turnEndIndex": 528, "totalLines": 528 }
+[2026-02-06T08:47:36.425Z] [store] selected latest successful turn from canonical transcript
 [2026-02-06T08:47:36.430Z] [store] assistantTexts count: 3
 [2026-02-06T08:47:36.435Z] [store] extracted: { "userLength": 59, "assistantLength": 847, ... }
 

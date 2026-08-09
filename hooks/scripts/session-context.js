@@ -33,7 +33,8 @@ import { getConfig, getGroupId } from './utils/config.js';
 import { saveGroup } from './utils/groups-store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SESSIONS_FILE = resolve(__dirname, '../../data/sessions.jsonl');
+const SESSIONS_FILE = process.env.EVERMEM_SESSIONS_FILE
+  || resolve(__dirname, '../../data/sessions.jsonl');
 
 const RECENT_MEMORY_COUNT = 5;  // Number of recent memories to load
 const PAGE_SIZE = 100;          // Fetch more to get the latest (API returns old to new)
@@ -113,19 +114,17 @@ async function main() {
   const config = getConfig();
 
   // Save group to local storage (track which projects use EverMem)
-  if (hookInput.cwd) {
+  const groupId = getGroupId();
+  if (hookInput.cwd && groupId) {
     try {
-      saveGroup(getGroupId(), hookInput.cwd);
+      saveGroup(groupId, hookInput.cwd);
     } catch (groupError) {
-      // Non-blocking, but log for debugging
       console.error(`EverMem groups-store error: ${groupError.message}`);
     }
   }
 
   if (!config.isConfigured) {
-    // Silently skip if not configured
-    console.log(JSON.stringify({ continue: true }));
-    return;
+    throw new Error('EverMem endpoint, user identity, or request deadline not configured');
   }
 
   try {
@@ -204,23 +203,17 @@ async function main() {
     }));
 
   } catch (error) {
-    // Don't block session start on errors, but provide detailed error info
-    const errorDetails = {
-      message: error.message,
-      code: error.code,
-      name: error.name
-    };
-
+    // Don't block session start on errors, but always say what broke.
     // Provide user-friendly error messages
     let userMessage = '⚠️ EverMem: ';
     if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-      userMessage += `Network error - cannot reach EverMem server. Check your internet connection.`;
-    } else if (error.code === 'ETIMEDOUT') {
+      userMessage += `Network error - cannot reach the configured EverMem endpoint.`;
+    } else if (error.code === 'ETIMEDOUT' || error.name === 'TimeoutError') {
       userMessage += `Request timeout - EverMem server is slow or unreachable.`;
     } else if (error.message?.includes('401') || error.message?.includes('Unauthorized')) {
       userMessage += `Authentication failed. Check your EVERMEM_API_KEY in .env file.`;
     } else if (error.message?.includes('404')) {
-      userMessage += `API endpoint not found. Check EVERMEM_BASE_URL in .env file.`;
+      userMessage += `API endpoint not found. Check EVERMEM_API_URL in .env file.`;
     } else if (error.message?.includes('ENOENT')) {
       userMessage += `File not found: ${error.path || 'unknown'}`;
     } else {

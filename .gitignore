@@ -31,4 +31,9 @@ dist/
 # Environment
 .env
 .env.*
+!.env.example
 testing_repo/
+
+# Installed-plugin state and deployment backups
+.orphaned_at
+*.bak.*

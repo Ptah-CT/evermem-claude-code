@@ -8,7 +8,11 @@ import { debug, setDebugPrefix } from './debug.js';
 
 // Set debug prefix for this script
 setDebugPrefix('EverMemAPI');
-const TIMEOUT_MS = 30000; // 30 seconds
+
+// Every request has a deployment-owned deadline from EVERMEM_REQUEST_TIMEOUT_MS.
+// The value is required configuration rather than a hard-coded guess: xinfty derives
+// it from EverMemOS's configured processing bound. Expiry aborts fetch and propagates
+// as an explicit hook failure instead of leaving a lifecycle handler hung forever.
 
 /**
  * Search memories from EverMem Cloud (v1)
@@ -23,7 +27,7 @@ export async function searchMemories(query, options = {}) {
   const config = getConfig();
 
   if (!config.isConfigured) {
-    throw new Error('EverMem API key not configured');
+    throw new Error('EverMem endpoint, user identity, or request deadline not configured');
   }
 
   const {
@@ -53,21 +57,15 @@ export async function searchMemories(query, options = {}) {
     apiKeyMasked: 'API_KEY_HIDDEN'
   };
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
   try {
     const response = await fetch(url, {
       method: 'POST',
+      signal: AbortSignal.timeout(config.requestTimeoutMs),
       headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal
+      body: JSON.stringify(requestBody)
     });
-
-    clearTimeout(timeoutId);
 
     const text = await response.text();
     let data;
@@ -84,10 +82,6 @@ export async function searchMemories(query, options = {}) {
     data._debug = debugEnvelope;
     return data;
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error(`API timeout after ${TIMEOUT_MS}ms`);
-    }
     return { _debug: { ...debugEnvelope, error: error.message } };
   }
 }
@@ -141,16 +135,17 @@ export async function addMemory(message) {
   const config = getConfig();
 
   if (!config.isConfigured) {
-    throw new Error('EverMem API key not configured');
+    throw new Error('EverMem endpoint, user identity, or request deadline not configured');
   }
 
   const role = message.role === 'assistant' ? 'assistant' : 'user';
   const sender_id = role === 'assistant' ? 'claude-assistant' : config.userId;
 
   const baseMessage = {
+    message_id: message.messageId || undefined,
     sender_id,
     role,
-    timestamp: Date.now(),
+    timestamp: message.timestamp || Date.now(),
     content: message.content
   };
 
@@ -161,6 +156,8 @@ export async function addMemory(message) {
     url = `${config.apiBaseUrl}/api/v1/memories/group`;
     requestBody = {
       group_id: config.groupId,
+      user_id: config.userId,
+      session_id: message.sessionId || undefined,
       messages: [baseMessage],
       async_mode: true
     };
@@ -168,6 +165,7 @@ export async function addMemory(message) {
     url = `${config.apiBaseUrl}/api/v1/memories`;
     requestBody = {
       user_id: config.userId,
+      session_id: message.sessionId || undefined,
       messages: [baseMessage],
       async_mode: true
     };
@@ -178,8 +176,8 @@ export async function addMemory(message) {
   try {
     response = await fetch(url, {
       method: 'POST',
+      signal: AbortSignal.timeout(config.requestTimeoutMs),
       headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(requestBody)
@@ -217,7 +215,7 @@ export async function getMemories(options = {}) {
   const config = getConfig();
 
   if (!config.isConfigured) {
-    throw new Error('EverMem API key not configured');
+    throw new Error('EverMem endpoint, user identity, or request deadline not configured');
   }
 
   const {
@@ -242,8 +240,8 @@ export async function getMemories(options = {}) {
 
   const response = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(config.requestTimeoutMs),
     headers: {
-      'Authorization': `Bearer ${config.apiKey}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(requestBody)
