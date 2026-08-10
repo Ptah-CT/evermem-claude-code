@@ -204,6 +204,79 @@ export async function addMemory(message) {
 }
 
 /**
+ * Close the accumulation window of a finished session (v1).
+ * Uses /api/v1/memories/group/flush when config.groupId is set, else
+ * /api/v1/memories/flush (personal).
+ *
+ * Why this exists: EverMemOS keys its accumulation window by
+ * (group_id, session_id) and only closes it when boundary detection produces a
+ * MemCell. A session id is never seen again once the session ends, so without
+ * an explicit flush the tail of every finished session stays unconsumed
+ * forever — present as raw rows, never turned into memory.
+ *
+ * Mirrors addMemory: HTTP errors are returned in the envelope rather than
+ * thrown, so the caller decides how loud to be.
+ *
+ * @param {Object} options
+ * @param {string} [options.sessionId] - Session whose window should be closed
+ * @returns {Promise<Object>} Debug envelope { url, body, status, ok, response }
+ */
+export async function flushSession(options = {}) {
+  const config = getConfig();
+
+  if (!config.isConfigured) {
+    throw new Error('EverMem endpoint, user identity, or request deadline not configured');
+  }
+
+  let url;
+  let requestBody;
+
+  if (config.groupId) {
+    url = `${config.apiBaseUrl}/api/v1/memories/group/flush`;
+    requestBody = { group_id: config.groupId };
+  } else {
+    url = `${config.apiBaseUrl}/api/v1/memories/flush`;
+    requestBody = {
+      user_id: config.userId,
+      session_id: options.sessionId || undefined
+    };
+  }
+
+  debug('flushSession request body', requestBody);
+
+  let response, responseText, responseData, status, ok;
+
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(config.requestTimeoutMs),
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(requestBody)
+    });
+    status = response.status;
+    ok = response.ok;
+    responseText = await response.text();
+    try {
+      responseData = JSON.parse(responseText);
+    } catch {}
+  } catch (fetchError) {
+    status = 0;
+    ok = false;
+    responseText = fetchError.message;
+  }
+
+  return {
+    url,
+    body: requestBody,
+    status,
+    ok,
+    response: responseData || responseText
+  };
+}
+
+/**
  * Get memories from EverMem Cloud (v1, ordered newest first by default).
  * @param {Object} options - Options
  * @param {number} options.page - Page number (default: 1)

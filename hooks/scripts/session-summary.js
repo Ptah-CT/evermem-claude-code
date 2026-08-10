@@ -9,6 +9,7 @@ import { appendFileSync, readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getGroupId, getConfig } from './utils/config.js';
+import { flushSession } from './utils/evermem-api.js';
 import { debug, setDebugPrefix } from './utils/debug.js';
 import { extractSessionStats, getCanonicalSessionId, isMarkedTestTurn, parseTranscript } from './utils/transcript.js';
 
@@ -112,7 +113,23 @@ async function main() {
     timestamp: new Date().toISOString()
   });
 
-  const message = `📝 Session (${parts.join(', ')}): "${displaySummary}"`;
+  // Close the accumulation window of this session. This is the last moment it
+  // can happen: the window is keyed by (group_id, session_id), and once the
+  // session is over no later request carries this session id, so an unflushed
+  // tail stays unconsumed forever. Reported in-band — a silently skipped flush
+  // looks exactly like a successful one.
+  const flush = await flushSession({ sessionId });
+  debug('flush result', flush);
+
+  let message = `📝 Session (${parts.join(', ')}): "${displaySummary}"`;
+  if (flush.ok) {
+    message += `\n🧹 Memory window closed (${flush.response?.data?.status || 'flushed'})`;
+  } else {
+    message += `\n⚠️ EverMem: Window flush failed (${flush.status})`;
+    message += `\nRequest: ${JSON.stringify(flush.body)}`;
+    message += `\nResponse: ${JSON.stringify(flush.response)}`;
+  }
+
   debug('output', message);
   writeMessage(message);
 }

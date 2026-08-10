@@ -363,6 +363,106 @@ test('session summaries preserve concurrent shutdown records', async () => {
 });
 
 
+test('session end closes the accumulation window of the finished session', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const transcript = writeTranscript(directory, 'flush-claude.jsonl', claudeEntries);
+    const result = await runHook('session-summary.js', {
+      session_id: 'flush-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    });
+
+    assert.match(result.systemMessage, /Memory window closed/);
+    const flushes = fake.requests.filter(request => request.path === '/api/v1/memories/flush');
+    assert.equal(flushes.length, 1);
+    assert.deepEqual(flushes[0].body, { user_id: 'fixture-user', session_id: 'flush-session' });
+    assert.equal(flushes[0].method, 'POST');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('session end flushes the group window when a group is configured', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const transcript = writeTranscript(directory, 'flush-group.jsonl', claudeEntries);
+    await runHook('session-summary.js', {
+      session_id: 'group-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_GROUP_ID: 'fixture-group',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    });
+
+    const flushes = fake.requests.filter(request => request.path === '/api/v1/memories/group/flush');
+    assert.equal(flushes.length, 1);
+    assert.deepEqual(flushes[0].body, { group_id: 'fixture-group' });
+    assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories/flush').length, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a failed window flush is reported in-band and still keeps the summary', async () => {
+  const directory = makeTempDir();
+  const sessionsFile = join(directory, 'sessions.jsonl');
+  const transcript = writeTranscript(directory, 'flush-fail.jsonl', claudeEntries);
+
+  const result = await runHook('session-summary.js', {
+    session_id: 'unreachable-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+  }, {
+    EVERMEM_API_URL: 'http://127.0.0.1:1',
+    EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+    EVERMEM_USER_ID: 'fixture-user',
+    EVERMEM_SESSIONS_FILE: sessionsFile,
+  });
+
+  assert.match(result.systemMessage, /Window flush failed/);
+  assert.match(result.systemMessage, /unreachable-session/);
+  const saved = JSON.parse(readFileSync(sessionsFile, 'utf8').trim());
+  assert.equal(saved.sessionId, 'unreachable-session');
+});
+
+test('skipped sessions do not flush a window they never filled', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const testEntries = structuredClone(claudeEntries);
+    testEntries[0].message.content = '[TEST-FLUSH-20260810T160000Z] probe';
+    const transcript = writeTranscript(directory, 'flush-skip.jsonl', testEntries);
+    const env = {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    };
+
+    const marked = await runHook('session-summary.js', {
+      session_id: 'marked-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, env);
+    assert.match(marked.systemMessage, /Test session detected/);
+
+    const empty = writeTranscript(directory, 'flush-empty.jsonl', [
+      { type: 'assistant', timestamp: '2026-08-08T09:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'no user turn' }] } },
+    ]);
+    const noTurns = await runHook('session-summary.js', {
+      session_id: 'empty-session', transcript_path: empty, cwd: pluginRoot, reason: 'quit',
+    }, env);
+    assert.match(noTurns.systemMessage, /no user turns/);
+
+    assert.equal(fake.requests.filter(request => request.path.includes('flush')).length, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
 test('hooks fail immediately when the deployment request deadline is invalid', async () => {
   const result = await runHook('inject-memories.js', {
     prompt: 'Configuration check prompt', cwd: pluginRoot,
