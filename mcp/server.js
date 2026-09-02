@@ -33,9 +33,19 @@ const TOOLS = [
 
 /**
  * Format date as relative time (e.g., "2 days ago", "today")
+ *
+ * A missing timestamp says "unknown", never "today". The API's keyword path
+ * returns hits without one (measured 2026-09-02: 0 of 20 carried a
+ * timestamp), and the client used to substitute the current time — so
+ * memories from April were displayed as "(just now)". A non-value is a
+ * statement about our knowledge, not about the world, and is shown as one.
  */
 function formatRelativeDate(timestamp) {
+  if (timestamp === null || timestamp === undefined) return 'unbekannt';
+
   const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return `unlesbar (${timestamp})`;
+
   const now = new Date();
   const diffMs = now - date;
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));

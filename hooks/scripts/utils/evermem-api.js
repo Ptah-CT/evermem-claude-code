@@ -88,7 +88,45 @@ export async function searchMemories(query, options = {}) {
 
 /**
  * Transform v1 search API response to plugin memory format.
- * v1 returns: { data: { episodes: [{ id, user_id, session_id, timestamp, summary, subject, score, participants, group_id? }], ... } }
+ *
+ * v1 answers a hybrid search from two paths, and THEY CARRY DIFFERENT FIELDS.
+ * Measured 2026-09-02 against a live EverMemOS deployment, twenty hits per
+ * method:
+ *
+ *     method     summary   subject   episode   timestamp
+ *     keyword      20/20     20/20     20/20       0/20
+ *     vector        0/20      0/20     20/20      20/20
+ *     hybrid        5/20      5/20     20/20      15/20
+ *
+ * Two consequences used to fall out of that, and both are fixed here.
+ *
+ * 1. EVERY VECTOR HIT WAS DISCARDED. This function read `ep.summary` and
+ *    skipped the entry when it was absent — which is every single vector
+ *    hit. The five memories a hybrid search surfaced were the keyword hits;
+ *    the vector path had been inert for as long as it existed, silently.
+ *    What that cost, measured on one real prompt: six of the discarded
+ *    vector hits sat at ranks 6, 8, 15, 23, 44 and 45, scoring 0.5036 down
+ *    to 0.4418, against 0.5479 for the rank-1 keyword hit that did survive.
+ *    The lowest-scoring discarded hit was still nearer the prompt than that
+ *    survivor, across a span of 0.10 — the same magnitude as the null
+ *    distribution's standard deviation on a comparable store (sigma =
+ *    0.1024). The ranking was sorting inside its own noise while the client
+ *    threw away the half that answered the question. `episode` carries the
+ *    full text and is present on every hit, so it is the fallback.
+ *
+ * 2. THE DATE WAS INVENTED. `ep.timestamp || new Date().toISOString()`
+ *    turned a missing timestamp into "now" — indistinguishable from a real
+ *    one. Memories from April and August were shown as "(just now)". A
+ *    missing value is now `null` and stays that way; the caller decides how
+ *    to render "unknown", and cannot mistake it for a fact.
+ *
+ * The two paths also return THE SAME DOCUMENT TWICE under different ids: a
+ * Mongo ObjectId from the keyword path, a UUID from the vector path, both
+ * with the same `parent_id`. They are two views of one memory, one holding
+ * subject/summary, the other holding the timestamp — so they are MERGED on
+ * `parent_id` rather than deduplicated, and the merged entry is complete
+ * where neither view was. Ordering keeps the better score of the two.
+ *
  * @param {Object} apiResponse - Raw v1 API response
  * @returns {Object[]} Formatted memories sorted by score desc
  */
@@ -98,24 +136,51 @@ export function transformSearchResults(apiResponse) {
     return [];
   }
 
-  const memories = [];
-  for (const ep of episodes) {
-    const content = ep.summary || '';
-    if (!content) continue;
+  const byDocument = new Map();
+  const ohneText = [];
 
-    memories.push({
-      text: content,
-      subject: ep.subject || '',
-      timestamp: ep.timestamp || new Date().toISOString(),
-      memoryType: ep.memory_type || 'episodic_memory',
-      score: ep.score || 0,
+  for (const ep of episodes) {
+    const content = ep.summary || ep.episode || '';
+    if (!content) {
+      // Not skipped in silence: an entry with no text at all is a finding
+      // about the store, and the caller is told how many there were.
+      ohneText.push(ep.id ?? ep.parent_id ?? '<no id>');
+      continue;
+    }
+
+    // parent_id identifies the memory across both id spaces; fall back to
+    // the path-local id when it is absent so nothing is dropped.
+    const schluessel = ep.parent_id || ep.id || Symbol('unkeyed');
+    const vorhanden = byDocument.get(schluessel);
+
+    const eintrag = {
+      text: vorhanden?.text || content,
+      subject: vorhanden?.subject || ep.subject || '',
+      timestamp: vorhanden?.timestamp ?? ep.timestamp ?? null,
+      memoryType: ep.memory_type || vorhanden?.memoryType || 'episodic_memory',
+      score: Math.max(ep.score || 0, vorhanden?.score || 0),
       metadata: {
-        groupId: ep.group_id,
-        type: ep.memory_type,
-        participants: ep.participants
+        groupId: ep.group_id ?? vorhanden?.metadata?.groupId,
+        type: ep.memory_type ?? vorhanden?.metadata?.type,
+        participants: ep.participants ?? vorhanden?.metadata?.participants
       }
-    });
+    };
+
+    // A summary is the better display text than the full episode; take it
+    // whenever either view supplies one.
+    if (ep.summary) eintrag.text = ep.summary;
+    if (ep.subject) eintrag.subject = ep.subject;
+    if (ep.timestamp) eintrag.timestamp = ep.timestamp;
+
+    byDocument.set(schluessel, eintrag);
   }
+
+  if (ohneText.length > 0) {
+    debug(`transformSearchResults: ${ohneText.length} von ${episodes.length} ` +
+          `Treffern tragen weder summary noch episode`, ohneText.slice(0, 10));
+  }
+
+  const memories = [...byDocument.values()];
 
   memories.sort((a, b) => b.score - a.score);
   return memories;
@@ -339,13 +404,21 @@ export function transformGetMemoriesResults(apiResponse) {
     return [];
   }
 
+  // No invented timestamps here either — see transformSearchResults. A
+  // missing value stays null; entries without one sort last rather than
+  // pretending to be from today.
   const memories = episodes.map(ep => ({
     text: ep.episode || ep.summary || '',
     subject: ep.subject || '',
-    timestamp: ep.timestamp || new Date().toISOString(),
+    timestamp: ep.timestamp ?? null,
     groupId: ep.group_id
   })).filter(m => m.text);
 
-  memories.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  memories.sort((a, b) => {
+    if (a.timestamp === b.timestamp) return 0;
+    if (a.timestamp === null) return 1;
+    if (b.timestamp === null) return -1;
+    return new Date(b.timestamp) - new Date(a.timestamp);
+  });
   return memories;
 }
