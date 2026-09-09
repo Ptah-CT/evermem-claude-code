@@ -15,6 +15,74 @@ setDebugPrefix('EverMemAPI');
 // as an explicit hook failure instead of leaving a lifecycle handler hung forever.
 
 /**
+ * Beschreibt einen Transportfehler SPRECHEND.
+ *
+ * WARUM DAS HIER STEHT. `fetch` wirft für JEDEN Transportfehler denselben
+ * nichtssagenden Text: `TypeError: fetch failed`. Die Unterscheidung —
+ * abgelehnte Verbindung, zurückgesetzte Verbindung, unerreichbares Netz,
+ * unbekannter Name — lebt ausschliesslich in `error.cause`. Bis zum
+ * 2026-09-09 haben die drei `catch`-Blöcke unten nur `error.message`
+ * übernommen und `cause` verworfen.
+ *
+ * WAS DAS GEKOSTET HAT, gemessen an 123 Transkripten einer Installation:
+ * 31 von 2.228 Ablagen scheiterten (1,4 %), vierzehn davon mit Status 0 und
+ * dem Text `"fetch failed"` — und alle vierzehn sind nachträglich
+ * ununterscheidbar. In einem der Fälle belegte das Protokoll des Dienstes,
+ * dass die Anfrage die Anwendung nie erreichte; WARUM die Verbindung
+ * ausblieb, konnte nicht mehr geklärt werden, weil genau diese Zeile die
+ * Antwort weggeworfen hatte. Eine Meldung, die nicht sagt, was passiert ist,
+ * ist kein Alarm.
+ *
+ * DIE URSACHE IST VERSCHACHTELT, deshalb wird die Kette abgelaufen und nicht
+ * nur die erste Ebene genommen: Node hängt bei `autoSelectFamily` einen
+ * `AggregateError` ein, dessen `errors` je Adressfamilie einen eigenen
+ * Fehler tragen. Genau dieser Fall trat auf: Ein Name löst auf mehrere
+ * Adressfamilien auf, und das Ziel nimmt nur auf einer davon an — dann steht
+ * die entscheidende Auskunft ausschliesslich im inneren Fehler.
+ *
+ * KEINE BEHANDLUNG. Diese Funktion beschreibt und heilt nicht: keine Frist,
+ * kein Wiederholungsversuch, kein Ersatzweg. Der Fehler bleibt ein Fehler.
+ *
+ * @param {unknown} error - Der gefangene Fehler
+ * @returns {string} Eine Zeile, die Typ, Text und alle bekannten
+ *   Betriebssystem-Felder der Ursachenkette nennt
+ */
+export function beschreibtFehler(error) {
+  const teile = [];
+  const gesehen = new Set();
+
+  const lauf = (e, tiefe) => {
+    if (!e || typeof e !== 'object' || gesehen.has(e) || tiefe > 8) {
+      if (typeof e === 'string' && e) teile.push(e);
+      return;
+    }
+    gesehen.add(e);
+
+    const kopf = e.name && e.message ? `${e.name}: ${e.message}`
+      : e.message || e.name || String(e);
+    // Die Felder, die das Betriebssystem liefert — jedes einzeln benannt,
+    // damit im Protokoll steht, WOHIN die Verbindung ging und woran sie lag.
+    const felder = ['code', 'errno', 'syscall', 'address', 'port', 'hostname'];
+    const vorhanden = felder
+      .filter(f => e[f] !== undefined && e[f] !== null && e[f] !== '')
+      .map(f => `${f}=${e[f]}`);
+    teile.push(vorhanden.length > 0 ? `${kopf} (${vorhanden.join(' ')})` : kopf);
+
+    // `AggregateError.errors`: je Adressfamilie ein eigener Fehler.
+    if (Array.isArray(e.errors)) {
+      for (const einzeln of e.errors) lauf(einzeln, tiefe + 1);
+    }
+    if (e.cause !== undefined && e.cause !== null) lauf(e.cause, tiefe + 1);
+  };
+
+  lauf(error, 0);
+  if (teile.length === 0) return String(error);
+  // Von aussen nach innen: der nichtssagende Kopf zuerst, dann die Ursache,
+  // die ihn erklärt. Wer nur den Anfang liest, verliert nichts Bekanntes.
+  return teile.join(' <- ');
+}
+
+/**
  * Search memories from EverMem Cloud (v1)
  * @param {string} query - Search query text
  * @param {Object} options - Additional options
@@ -82,7 +150,7 @@ export async function searchMemories(query, options = {}) {
     data._debug = debugEnvelope;
     return data;
   } catch (error) {
-    return { _debug: { ...debugEnvelope, error: error.message } };
+    return { _debug: { ...debugEnvelope, error: beschreibtFehler(error) } };
   }
 }
 
@@ -256,7 +324,9 @@ export async function addMemory(message) {
   } catch (fetchError) {
     status = 0;
     ok = false;
-    responseText = fetchError.message;
+    // `fetchError.message` allein ist immer "fetch failed" — siehe
+    // `beschreibtFehler`. Die Ursachenkette gehört in die Meldung.
+    responseText = beschreibtFehler(fetchError);
   }
 
   return {
@@ -329,7 +399,9 @@ export async function flushSession(options = {}) {
   } catch (fetchError) {
     status = 0;
     ok = false;
-    responseText = fetchError.message;
+    // `fetchError.message` allein ist immer "fetch failed" — siehe
+    // `beschreibtFehler`. Die Ursachenkette gehört in die Meldung.
+    responseText = beschreibtFehler(fetchError);
   }
 
   return {
