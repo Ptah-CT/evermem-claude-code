@@ -32,7 +32,7 @@ function writeTranscript(directory, name, entries) {
 async function runHook(script, payload, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(nodeBin, [join(pluginRoot, 'hooks/scripts', script)], {
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', EVERMEM_REQUEST_TIMEOUT_MS: '3600000', ...env },
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -484,6 +484,48 @@ test('skipped sessions do not flush a window they never filled', async () => {
 // `false` zu bringen, solange die `.env` existiert — ein Test dafür wäre eine
 // Zusage, die er nicht einlöst. Lieber keiner als einer, der grün wird, weil
 // er etwas anderes misst.
+
+// DER ABRUFHOOK WAR VON KEINEM TEST BERÜHRT, und das ist am 2026-09-09 teuer
+// geworden. `inject-memories.js` kam in dieser Datei GAR NICHT vor — der
+// einzige Test, der ihn je gestartet hatte, war der oben entfernte, und er
+// prüfte etwas ganz anderes (die Fristvalidierung). Als ich beim Umbau in
+// `config.js` eine Funktion entfernte und ihren Aufrufer einen Schritt später,
+// brach der Abruf im Betrieb mit `ReferenceError: getRequestTimeoutMs is not
+// defined` — nach 0,0 s, also beim Laden. Die Testreihe stand zu diesem
+// Zeitpunkt auf 16/16 grün.
+//
+// Deshalb steht hier jetzt eine Rauchprobe: Sie startet den echten Hook als
+// eigenen Prozess gegen die Attrappe und prüft, dass er lädt, sucht und ein
+// wohlgeformtes Ergebnis liefert. Sie fängt keinen Logikfehler — sie fängt
+// genau die Klasse, die hier zugeschlagen hat: eine Datei, die sich nicht mehr
+// laden lässt.
+test('the recall hook loads, searches and returns a well-formed result', async () => {
+  const fake = await startFakeEvermem();
+  try {
+    const result = await runHook('inject-memories.js', {
+      prompt: 'a prompt with enough words to pass the minimum', cwd: pluginRoot,
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+    });
+
+    assert.ok(result, 'Der Abrufhook hat gar nichts ausgegeben — das ist der Ladefehler.');
+    assert.doesNotMatch(result.systemMessage, /recall FAILED/,
+      `Der Abruf meldete einen Fehler: ${result.systemMessage}`);
+    assert.match(result.systemMessage, /Memory Retrieved/);
+    assert.match(
+      result.hookSpecificOutput.additionalContext,
+      /Relevant memory for the current prompt/,
+    );
+
+    const suchen = fake.requests.filter(r => r.path === '/api/v1/memories/search');
+    assert.equal(suchen.length, 1);
+    assert.deepEqual(suchen[0].body.filters, { user_id: 'fixture-user' });
+  } finally {
+    await fake.close();
+  }
+});
 
 // Eine Frist auf diesem Pfad ist ein Rückfall, kein Detail — deshalb wird sie
 // geprüft und nicht dem guten Willen überlassen. Der Server nimmt an, liest
