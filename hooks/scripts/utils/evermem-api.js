@@ -3,6 +3,8 @@
  * Handles memory search and storage operations
  */
 
+import { request as httpAnfrage } from 'node:http';
+import { request as httpsAnfrage } from 'node:https';
 import { getConfig } from './config.js';
 import { debug, setDebugPrefix } from './debug.js';
 
@@ -10,9 +12,115 @@ import { debug, setDebugPrefix } from './debug.js';
 setDebugPrefix('EverMemAPI');
 
 // Every request has a deployment-owned deadline from EVERMEM_REQUEST_TIMEOUT_MS.
-// The value is required configuration rather than a hard-coded guess: xinfty derives
-// it from EverMemOS's configured processing bound. Expiry aborts fetch and propagates
-// as an explicit hook failure instead of leaving a lifecycle handler hung forever.
+// The value is required configuration rather than a hard-coded guess: it is derived
+// from EverMemOS's configured processing bound. Expiry aborts the request and
+// propagates as an explicit hook failure instead of leaving a lifecycle handler
+// hung forever.
+//
+// UND ES IST DIE EINZIGE FRIST — seit dem 2026-09-09 auch wirklich.
+//
+// Bis dahin liefen diese Aufrufe über `fetch`, und darunter sitzen DREI
+// unsichtbare Fristen der Bibliothek, jede mit einem Vorgabewert, den niemand
+// gewählt hat. Gemessen an Node v22.21.1, je mit einem Aufbau, der genau eine
+// davon auslöst und sonst nichts:
+//
+//     connectTimeout    10.504 ms   Ziel nimmt die Verbindung nie an
+//     headersTimeout   300.762 ms   Server nimmt an, liest, antwortet nie
+//     bodyTimeout      300.xxx ms   Kopfzeilen ja, Rumpf nie
+//
+// DIE KONFIGURIERTE FRIST WAR DAMIT EIN VERSPRECHEN OHNE REICHWEITE: Sie stand
+// auf 3.600.000 ms, und der Aufruf starb nach 300.762 ms — zwölfmal früher, als
+// die sichtbare Zahl zusagte. Dieselbe Klasse wie ein Feld ohne Leser: Es steht
+// da, es liest sich wie eine Zusage, und es wirkt nicht.
+//
+// WAS DAS KOSTETE, gemessen: Die `add`-Anfrage des Dienstes läuft synchron
+// 293–323 s (Journal, `stage_timer`). Die Frist von 300,76 s liegt MITTEN
+// DARIN. Jede Ablage, die etwas länger brauchte als üblich, war per
+// Konstruktion eine Fehlermeldung — bei 2.207 gelungenen Ablagen lag keine
+// einzige über 267 s, und drei Fehlschläge sitzen auf 300,9 / 300,9 / 301,2 s.
+//
+// DESHALB `node:http` STATT `fetch`, und das ist der Kern der Änderung: Der
+// Kern-Klient bringt KEINE eigene Antwortfrist mit. Es gibt hier nichts zu
+// überschreiben und keinen Vorgabewert, der beim nächsten Aktualisieren der
+// Laufzeit zurückkommt — es gibt nur die eine Zahl unten, und die steht in der
+// Konfiguration. Eine größere Zahl an derselben Stelle wäre keine Herleitung
+// gewesen, sondern eine erfundene Zahl gegen eine andere getauscht.
+//
+// WAS EIN WIRKLICH HÄNGENDER AUFRUF JETZT TUT — bewusst so, nicht nebenbei:
+// Er wartet die volle konfigurierte Frist ab (im Bestand eine Stunde) und
+// scheitert dann laut mit `EVERMEM_DEADLINE`, das die Zahl im Text nennt. Der
+// Stop-Hook läuft asynchron mit einer Harness-Frist von 86.400 s, ein
+// hängender Aufruf hält also einen Node-Prozess, keine Sitzung. Das ist die
+// Entscheidung, die in `EVERMEM_REQUEST_TIMEOUT_MS` steht: lieber lange warten
+// als eine laufende Ablage abschneiden — „gut Ding braucht Weile, und Fehler
+// werden geworfen". Wer das anders will, ändert die Zahl, nicht den Code.
+
+/**
+ * Schickt eine JSON-Anfrage und wartet auf die VOLLSTÄNDIGE Antwort.
+ *
+ * Genau eine Frist, und zwar die übergebene: ein Zeitgeber über den ganzen
+ * Vorgang — Verbindungsaufbau, Kopfzeilen und Rumpf zusammen. Kein
+ * Wiederholungsversuch, kein Ersatzweg, keine Umleitung.
+ *
+ * @param {string} url - Vollständige Zieladresse
+ * @param {Object} optionen
+ * @param {string} [optionen.method] - HTTP-Verfahren, Vorgabe `POST`
+ * @param {string} [optionen.body] - Bereits serialisierter Rumpf
+ * @param {number} optionen.timeoutMs - Die Frist; Pflicht, kein Vorgabewert
+ * @returns {Promise<{status: number, ok: boolean, text: string}>}
+ * @throws bei Transportfehler oder Fristablauf — mit `code`, `errno`,
+ *   `syscall`, `address` und `port`, soweit das Betriebssystem sie liefert.
+ *   `beschreibtFehler` macht daraus die Meldung.
+ */
+function sendetJson(url, { method = 'POST', body, timeoutMs }) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`sendetJson: unbrauchbare Frist ${timeoutMs}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const ziel = new URL(url);
+    const anfragen = ziel.protocol === 'https:' ? httpsAnfrage : httpAnfrage;
+    const nutzlast = body === undefined ? undefined : Buffer.from(body, 'utf8');
+
+    const req = anfragen(ziel, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...nutzlast === undefined ? {} : { 'Content-Length': nutzlast.byteLength },
+      },
+    });
+
+    let erledigt = false;
+    const uhr = setTimeout(() => {
+      req.destroy(Object.assign(
+        new Error(`EverMem: keine vollständige Antwort binnen ${timeoutMs} ms`),
+        { code: 'EVERMEM_DEADLINE', timeoutMs, address: ziel.hostname, port: ziel.port },
+      ));
+    }, timeoutMs);
+
+    const fertig = (fn, wert) => {
+      if (erledigt) return;
+      erledigt = true;
+      clearTimeout(uhr);
+      fn(wert);
+    };
+
+    req.on('response', res => {
+      const teile = [];
+      res.on('data', stueck => teile.push(stueck));
+      res.on('end', () => fertig(resolve, {
+        status: res.statusCode,
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        text: Buffer.concat(teile).toString('utf8'),
+      }));
+      res.on('error', fehler => fertig(reject, fehler));
+    });
+    req.on('error', fehler => fertig(reject, fehler));
+
+    if (nutzlast !== undefined) req.write(nutzlast);
+    req.end();
+  });
+}
 
 /**
  * Beschreibt einen Transportfehler SPRECHEND.
@@ -126,16 +234,13 @@ export async function searchMemories(query, options = {}) {
   };
 
   try {
-    const response = await fetch(url, {
+    const response = await sendetJson(url, {
       method: 'POST',
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      timeoutMs: config.requestTimeoutMs,
     });
 
-    const text = await response.text();
+    const text = response.text;
     let data;
     try {
       data = JSON.parse(text);
@@ -307,17 +412,14 @@ export async function addMemory(message) {
   let response, responseText, responseData, status, ok;
 
   try {
-    response = await fetch(url, {
+    response = await sendetJson(url, {
       method: 'POST',
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      timeoutMs: config.requestTimeoutMs,
     });
     status = response.status;
     ok = response.ok;
-    responseText = await response.text();
+    responseText = response.text;
     try {
       responseData = JSON.parse(responseText);
     } catch {}
@@ -382,17 +484,14 @@ export async function flushSession(options = {}) {
   let response, responseText, responseData, status, ok;
 
   try {
-    response = await fetch(url, {
+    response = await sendetJson(url, {
       method: 'POST',
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      timeoutMs: config.requestTimeoutMs,
     });
     status = response.status;
     ok = response.ok;
-    responseText = await response.text();
+    responseText = response.text;
     try {
       responseData = JSON.parse(responseText);
     } catch {}
@@ -448,21 +547,17 @@ export async function getMemories(options = {}) {
     rank_order: 'desc'
   };
 
-  const response = await fetch(url, {
+  const response = await sendetJson(url, {
     method: 'POST',
-    signal: AbortSignal.timeout(config.requestTimeoutMs),
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(requestBody),
+    timeoutMs: config.requestTimeoutMs,
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`API error ${response.status}: ${errorText}`);
+    throw new Error(`API error ${response.status}: ${response.text}`);
   }
 
-  return await response.json();
+  return JSON.parse(response.text);
 }
 
 /**
