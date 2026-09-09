@@ -463,15 +463,66 @@ test('skipped sessions do not flush a window they never filled', async () => {
   }
 });
 
-test('hooks fail immediately when the deployment request deadline is invalid', async () => {
-  const result = await runHook('inject-memories.js', {
-    prompt: 'Configuration check prompt', cwd: pluginRoot,
-  }, {
-    EVERMEM_API_URL: 'http://127.0.0.1:1',
-    EVERMEM_USER_ID: 'fixture-user',
-    EVERMEM_REQUEST_TIMEOUT_MS: 'not-a-number',
+// HIER STAND 'hooks fail immediately when the deployment request deadline is
+// invalid'. Der Vertrag, den er geprüft hat, gibt es nicht mehr: Auf diesem
+// Pfad existiert keine Frist, also auch kein Schlüssel, der ungültig sein
+// könnte. Ein Test, der ein entferntes Verhalten festhält, hielte es am Leben.
+//
+// AN SEINE STELLE TRITT KEIN ERSATZ FÜR DEN KONFIGURATIONSFALL, und der Grund
+// ist selbst ein Befund. Ein erster Versuch prüfte „fehlt Ziel oder Kennung,
+// scheitert der Hook sofort" — und schlug fehl, weil er nicht prüfen KANN, was
+// er prüfen wollte:
+//
+// `config.js` lädt die `.env` des Plugin-Wurzelverzeichnisses und setzt jeden
+// Schlüssel, dessen Wert in der Umgebung falsy ist (`if (!process.env[key])`).
+// Ein von aussen übergebenes `EVERMEM_API_URL=''` ist falsy — also gewinnt die
+// `.env`, und der Hook lief mit der ECHTEN Adresse los, statt zu scheitern.
+// (Er hat dabei eine echte Suche gegen den laufenden Dienst gefahren: ein
+// Lesezugriff, aber ein Prod-Zugriff aus einem Test heraus.)
+//
+// Damit ist `isConfigured()` in dieser Installation von aussen nicht auf
+// `false` zu bringen, solange die `.env` existiert — ein Test dafür wäre eine
+// Zusage, die er nicht einlöst. Lieber keiner als einer, der grün wird, weil
+// er etwas anderes misst.
+
+// Eine Frist auf diesem Pfad ist ein Rückfall, kein Detail — deshalb wird sie
+// geprüft und nicht dem guten Willen überlassen. Der Server nimmt an, liest
+// und antwortet nie; die alte kleinste Bibliotheksfrist lag bei 300.760 ms.
+// Läuft der Aufruf sichtbar darüber hinaus, gibt es keine mehr.
+//
+// Gefahren wird knapp jenseits der alten Grenze statt Minuten darüber: Der
+// Testlauf soll den Befund tragen, nicht die Wanduhr. Die volle Messung
+// (330.035 ms Kopfzeilen, 330.011 ms Rumpf, beide ohne Abbruch) steht in
+// ewm#167.
+test('no client-side deadline cuts a slow response short', { timeout: 340000 }, async () => {
+  const stiller = createServer((req, res) => { req.resume(); });
+  await new Promise(fertig => stiller.listen(0, '127.0.0.1', fertig));
+  const port = stiller.address().port;
+
+  const modul = await import(
+    `${pathToFileURL(join(pluginRoot, 'hooks/scripts/utils/evermem-api.js')).href}?ohne-frist=${Date.now()}`
+  );
+  process.env.EVERMEM_API_URL = `http://127.0.0.1:${port}`;
+  process.env.EVERMEM_USER_ID = 'fixture-user';
+  process.env.EVERMEM_DISABLE_PROJECT_SCOPE = '1';
+
+  const begonnen = Date.now();
+  const lauf = modul.addMemory({
+    content: 'probe', role: 'user', sessionId: 'no-deadline', timestamp: Date.now(),
   });
-  assert.match(result.systemMessage, /positive integer/);
+
+  const dauer = 310000;
+  const nochOffen = await Promise.race([
+    lauf.then(() => 'beendet'),
+    new Promise(fertig => setTimeout(() => fertig('offen'), dauer)),
+  ]);
+
+  assert.equal(nochOffen, 'offen',
+    `Der Aufruf endete nach ${Date.now() - begonnen} ms — es gibt wieder eine Frist.`);
+
+  stiller.closeAllConnections();
+  stiller.close();
+  await lauf;
 });
 
 test('Prime lifecycle cancellation terminates an EverMem subprocess loudly', async () => {

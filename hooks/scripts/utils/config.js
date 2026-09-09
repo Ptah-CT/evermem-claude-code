@@ -86,28 +86,36 @@ export function getApiBaseUrl() {
   return process.env.EVERMEM_API_URL || API_BASE_URL;
 }
 
-/**
- * Get the deployment-owned request deadline.
- * This must reflect the real EverMem service processing bound; there is no
- * hard-coded fallback because an invented default either hangs or kills valid work.
- * @returns {number|null} Deadline in milliseconds or null when unconfigured
- */
-export function getRequestTimeoutMs() {
-  const raw = process.env.EVERMEM_REQUEST_TIMEOUT_MS;
-  if (!raw) return null;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error('EVERMEM_REQUEST_TIMEOUT_MS must be a positive integer');
-  }
-  return value;
-}
+// HIER STAND `getRequestTimeoutMs()` UND `EVERMEM_REQUEST_TIMEOUT_MS`.
+// Ersatzlos entfernt am 2026-09-09 — nicht hochgesetzt, weg.
+//
+// UND SIE WAR NICHT EINMAL WILLKÜRLICH — das ist der interessantere Teil.
+// `.env.example` nannte ihre Herleitung: Sie spiegelte den serverseitigen
+// `boundary_detection_timeout` der Installation (3600 s), war insofern sauber
+// abgeleitet — und half trotzdem nichts:
+//
+//   1. Sie GALT NIE. Unter `fetch` lagen drei Fristen der Bibliothek, die
+//      kleinste davon 300.760 ms. Der Aufruf starb zwölfmal früher, als die
+//      abgeleitete Zahl zusagte.
+//   2. Selbst wenn sie gegolten hätte, wäre sie die falsche Art von Zahl.
+//      Eine Frist des SERVERS an einer Klientenseite nachzubauen heisst, eine
+//      Zusage zu wiederholen, die man nicht selbst einhalten kann — und aus
+//      ihrem Ablauf einen dritten Ausgang zu machen, den es nicht gibt.
+//
+// Eine gut abgeleitete Frist bleibt eine Frist. Sie „die richtige" zu nennen,
+// weil sie konfiguriert oder hergeleitet ist, ist dieselbe Verkleidung wie
+// „Budget" oder „SLA".
+//
+// Ein Konfigurationsschlüssel für eine Zahl, die es nicht geben soll, lädt dazu
+// ein, sie wieder einzuführen. Deshalb ist auch der Schlüssel weg und nicht nur
+// sein Wert. Die Begründung steht bei `sendetJson` in `evermem-api.js`.
 
 /**
- * Check if the self-hosted EverMem endpoint, user identity, and request deadline are configured.
+ * Check if the self-hosted EverMem endpoint and user identity are configured.
  * @returns {boolean}
  */
 export function isConfigured() {
-  return !!getApiBaseUrl() && !!getUserId() && !!getRequestTimeoutMs();
+  return !!getApiBaseUrl() && !!getUserId();
 }
 
 /**
@@ -134,7 +142,6 @@ export function getConfig() {
     userId: getUserId(),
     groupId: getGroupId(),
     apiBaseUrl: getApiBaseUrl(),
-    requestTimeoutMs: getRequestTimeoutMs(),
     isConfigured: isConfigured()
   };
 }
