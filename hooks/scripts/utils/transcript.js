@@ -26,6 +26,44 @@ function extractVisibleText(content) {
     .map(block => block.text);
 }
 
+// The harness delivers content from three sources besides the operator's own words, and each can
+// land as a plain `user`-role transcript entry indistinguishable from a real prompt without
+// inspecting the text: a message relayed from another Claude Code session
+// (`<cross-session-message>`), a teammate/subagent report relayed into this session
+// (`<agent-message>`, `<teammate-message>`), and a background task's completion notice
+// (`<task-notification>`). None of these are the operator speaking. Storing them as role:'user'
+// content misattributes them to the operator (measured 2026-09-25 against session
+// ec541dbf-d9a8-40f9-9c40-44b8a4628809: a queued `<agent-message from="vikunja-atlas">` report
+// landed inside the stored "user" turn next to a real prompt). This mirrors the detection
+// dev-team-erinnerung already carries for the same transcript format
+// (internal/transkript/transkript.go, commit 7479229 "Nachrichten anderer Sitzungen nicht der
+// empfangenden zuschreiben") — same markers, generalized to the other relay forms it doesn't see.
+const FOREIGN_MESSAGE_TAGS = ['<cross-session-message', '<agent-message', '<teammate-message', '<task-notification>'];
+const FOREIGN_MESSAGE_INTRO = /^(Another Claude session sent a message:|A teammate sent a message:)\s*/;
+
+export function isForeignInjectedText(text) {
+  if (typeof text !== 'string') return false;
+  const stripped = text.trim().replace(FOREIGN_MESSAGE_INTRO, '');
+  return FOREIGN_MESSAGE_TAGS.some(tag => stripped.startsWith(tag));
+}
+
+function extractOperatorTexts(content) {
+  return extractVisibleText(content).filter(text => !isForeignInjectedText(text));
+}
+
+// Whether a transcript entry belongs to the Claude Code JSONL format or the Prime Agent format.
+// Both formats can appear in a transcript file over its lifetime (Prime entries carry `id`/
+// `type: 'session'|'message'`); this check is shared by every function below that branches on it.
+export function isPrimeTranscript(entries) {
+  return entries.some(entry => entry?.type === 'session' || entry?.type === 'message');
+}
+
+// The stable per-entry identity Claude Code JSONL lines carry. Used as a Stop-hook cursor so a
+// transcript can be resumed from a known point instead of being re-walked from the start.
+export function getClaudeEntryUuid(entry) {
+  return typeof entry?.uuid === 'string' && entry.uuid ? entry.uuid : null;
+}
+
 function getPrimeActiveBranch(entries) {
   const linked = entries.filter(entry => entry?.id);
   if (linked.length === 0) return entries;
@@ -96,7 +134,7 @@ function extractPrimeTurnState(messages) {
         current = null;
       }
       current ||= beginTurn();
-      current.userTexts.push(...extractVisibleText(message.content));
+      current.userTexts.push(...extractOperatorTexts(message.content));
       current.timestamp = message.timestamp ?? current.timestamp;
       continue;
     }
@@ -115,7 +153,9 @@ function extractPrimeTurnState(messages) {
   return { turns, latestTurn };
 }
 
-function extractClaudeTurns(entries) {
+// Exported so store-memories.js can segment just the slice of entries a Stop-hook cursor has not
+// stored yet, instead of re-walking (and re-accumulating) the full transcript on every Stop.
+export function extractClaudeTurns(entries) {
   const turns = [];
   let current = { userTexts: [], assistantTexts: [], timestamp: null };
 
@@ -136,7 +176,7 @@ function extractClaudeTurns(entries) {
       continue;
     }
     if (entry?.type === 'user' && entry.message?.role === 'user') {
-      current.userTexts.push(...extractVisibleText(entry.message.content));
+      current.userTexts.push(...extractOperatorTexts(entry.message.content));
       current.timestamp = entry.timestamp ?? current.timestamp;
     } else if (entry?.type === 'assistant' && entry.message?.role === 'assistant') {
       current.assistantTexts.push(...extractVisibleText(entry.message.content));
@@ -149,7 +189,7 @@ function extractClaudeTurns(entries) {
 }
 
 export function extractLastTurn(entries) {
-  const isPrime = entries.some(entry => entry?.type === 'session' || entry?.type === 'message');
+  const isPrime = isPrimeTranscript(entries);
   const primeState = isPrime ? extractPrimeTurnState(getPrimeActiveBranch(entries)) : null;
   const turns = primeState?.turns || extractClaudeTurns(entries);
   const turn = primeState ? primeState.latestTurn : turns.at(-1);
@@ -159,7 +199,7 @@ export function extractLastTurn(entries) {
 }
 
 export function extractSessionStats(entries) {
-  const isPrime = entries.some(entry => entry?.type === 'session' || entry?.type === 'message');
+  const isPrime = isPrimeTranscript(entries);
   const activeEntries = isPrime ? getPrimeActiveBranch(entries) : entries;
   const turns = isPrime
     ? extractPrimeTurnState(activeEntries).turns
