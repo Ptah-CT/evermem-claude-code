@@ -13,6 +13,7 @@ import {
   isMarkedTestTurn,
   parseTranscript,
 } from '../hooks/scripts/utils/transcript.js';
+import { writeStopCursor } from '../hooks/scripts/utils/stop-cursor.js';
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -230,11 +231,16 @@ test('store hook uses the canonical transcript even when a Prime message snapsho
   const fake = await startFakeEvermem();
   const directory = makeTempDir();
   try {
-    const env = { EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user' };
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
     const primeFile = writeTranscript(directory, 'prime.jsonl', primeEntries);
     const primeResult = await runHook('store-memories.js', { transcript_path: primeFile, prime_messages: [], cwd: pluginRoot }, env);
     assert.match(primeResult.systemMessage, /Memory saved \(2\)/);
 
+    // claudeEntries has two completed turns and no prior cursor for this (new) session. A
+    // session's first Stop must never backfill — only the latest turn is new.
     const claudeFile = writeTranscript(directory, 'claude.jsonl', claudeEntries);
     const claudeResult = await runHook('store-memories.js', { transcript_path: claudeFile, cwd: pluginRoot }, env);
     assert.match(claudeResult.systemMessage, /Memory saved \(2\)/);
@@ -243,6 +249,201 @@ test('store hook uses the canonical transcript even when a Prime message snapsho
     assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), [
       'Latest Claude answer', 'Latest Claude question', 'Prime assistant answer', 'Prime user question',
     ]);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook only resends what a session added since its last successful store', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'growth-session';
+
+    // First Stop: transcript has one finished turn.
+    const firstEntries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'First question' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'First answer' }] } },
+      // No turn_duration boundary here — this is the exact condition that made the pre-fix
+      // extraction keep accumulating into a single ever-growing "last turn".
+    ];
+    const transcript = writeTranscript(directory, 'growth.jsonl', firstEntries);
+    const firstResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(firstResult.systemMessage, /Memory saved \(2\)/);
+
+    // Second Stop: transcript now also has a second turn, appended without a boundary before it,
+    // exactly like the measured case. Only the second turn's content must be sent this time.
+    const secondEntries = [
+      ...firstEntries,
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:01:00.000Z', message: { role: 'user', content: 'Second question' } },
+      { type: 'assistant', uuid: 'a2', sessionId, timestamp: '2026-09-25T00:01:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Second answer' }] } },
+    ];
+    writeTranscript(directory, 'growth.jsonl', secondEntries);
+    const secondResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(secondResult.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    assert.equal(stored.length, 4);
+    assert.deepEqual(stored.map(request => request.body.messages[0].content), [
+      'First question', 'First answer', 'Second question', 'Second answer',
+    ]);
+
+    // A third Stop with nothing new appended must not resend anything.
+    const thirdResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(thirdResult.systemMessage, /No new turns since last store/);
+    assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories').length, 4);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook never backfills: with no cursor for N turns, only the latest is sent', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'no-backfill-session';
+
+    // A session whose FIRST-EVER Stop already sees three completed turns (e.g. several real
+    // exchanges happened before the hook could run, or without a turn_duration boundary between
+    // them). Sending everything since the transcript began would push this session's whole
+    // backlog through EverOS's boundary detection on a single Stop — a migration against a
+    // shared, quota-limited deployment, not a Stop hook. Only the newest turn may go out; the
+    // other two are never recovered, matching what the hook always sent before cursoring existed.
+    const entries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Turn one question' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn one answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td1', sessionId, timestamp: '2026-09-25T00:00:06.000Z' },
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:01:00.000Z', message: { role: 'user', content: 'Turn two question' } },
+      { type: 'assistant', uuid: 'a2', sessionId, timestamp: '2026-09-25T00:01:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn two answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td2', sessionId, timestamp: '2026-09-25T00:01:06.000Z' },
+      { type: 'user', uuid: 'u3', sessionId, timestamp: '2026-09-25T00:02:00.000Z', message: { role: 'user', content: 'Turn three question' } },
+      { type: 'assistant', uuid: 'a3', sessionId, timestamp: '2026-09-25T00:02:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn three answer' }] } },
+    ];
+    const transcript = writeTranscript(directory, 'no-backfill.jsonl', entries);
+    const result = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(result.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), [
+      'Turn three answer', 'Turn three question',
+    ]);
+
+    // The next Stop, with nothing new appended, must not resend anything — including not the
+    // two older turns that were never sent.
+    const secondResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(secondResult.systemMessage, /No new turns since last store/);
+    assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories').length, 2);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook degrades to the latest turn only, never a backfill, when its cursor entry is gone from the transcript', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'rewritten-transcript-session';
+
+    // Prime the cursor with an entry uuid that this transcript does not contain (e.g. the
+    // transcript was rewritten by compaction and no longer has the line the cursor points at).
+    writeStopCursor(sessionId, 'entry-that-no-longer-exists', join(directory, 'stop-cursors.jsonl'));
+
+    const entries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Old question' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Old answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td1', sessionId, timestamp: '2026-09-25T00:00:06.000Z' },
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:01:00.000Z', message: { role: 'user', content: 'New question' } },
+      { type: 'assistant', uuid: 'a2', sessionId, timestamp: '2026-09-25T00:01:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'New answer' }] } },
+    ];
+    const transcript = writeTranscript(directory, 'rewritten.jsonl', entries);
+    const result = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(result.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), ['New answer', 'New question']);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook does not advance the cursor past a failed store, and retries it next Stop', async () => {
+  const directory = makeTempDir();
+  const env = {
+    EVERMEM_API_URL: 'http://127.0.0.1:1', EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+    EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+  };
+  const sessionId = 'retry-session';
+  const entries = [
+    { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Question that cannot reach the server' } },
+    { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Answer' }] } },
+  ];
+  const transcript = writeTranscript(directory, 'retry.jsonl', entries);
+
+  const firstResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+  assert.match(firstResult.systemMessage, /Save failed/);
+
+  // Nothing new was appended, but the failed turn must still be there to retry.
+  const secondResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+  assert.match(secondResult.systemMessage, /Save failed/);
+  assert.match(secondResult.systemMessage, /Question that cannot reach the server|Answer/);
+});
+
+test('store hook drops relayed cross-session, teammate, and task-notification text from the operator turn', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'relay-session';
+
+    // A queued <agent-message> report lands as its own user-role entry alongside the operator's
+    // real prompt, merged by the harness into the same turn — exactly the shape measured in
+    // session ec541dbf-d9a8-40f9-9c40-44b8a4628809.
+    const entries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Please build the tool' } },
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:00:01.000Z', message: { role: 'user', content: 'Another Claude session sent a message:\n<agent-message from="teammate">Teammate report</agent-message>' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } },
+    ];
+    const transcript = writeTranscript(directory, 'relay.jsonl', entries);
+    const result = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(result.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    const userStore = stored.find(request => request.body.messages[0].role === 'user');
+    assert.equal(userStore.body.messages[0].content, 'Please build the tool');
+
+    // A user-role entry that is ENTIRELY a cross-session message, a bare queued
+    // <task-notification>, or a bare <teammate-message> must not surface as an operator turn.
+    const standaloneCases = [
+      'Another Claude session sent a message:\n<cross-session-message from="x">hello</cross-session-message>',
+      '<task-notification>\n<task-id>abc</task-id>\n</task-notification>',
+      '<teammate-message teammate_id="lead">status</teammate-message>',
+    ];
+    for (const [index, text] of standaloneCases.entries()) {
+      const standaloneEntries = [
+        { type: 'user', uuid: `s${index}`, sessionId: `${sessionId}-${index}`, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: text } },
+        { type: 'assistant', uuid: `sa${index}`, sessionId: `${sessionId}-${index}`, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Handled' }] } },
+      ];
+      const standaloneTranscript = writeTranscript(directory, `relay-standalone-${index}.jsonl`, standaloneEntries);
+      const standaloneResult = await runHook('store-memories.js', {
+        transcript_path: standaloneTranscript, session_id: `${sessionId}-${index}`, cwd: pluginRoot,
+      }, env);
+      assert.match(standaloneResult.systemMessage, /No new turns since last store/);
+    }
   } finally {
     await fake.close();
   }
