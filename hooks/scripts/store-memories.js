@@ -72,6 +72,24 @@ function reportFailure(error) {
 // already follows explicit parentId chains to a terminal stopReason and isolates just the latest
 // completed turn on its own — it does not exhibit the unbounded-growth defect the Claude-format
 // path below guards against, so it keeps using the full-transcript extraction unchanged.
+// The uuid of the last identified entry in `entries`, scanning from the end. Used both to know
+// where a slice ends (the next cursor) and, with the full array, where "no backfill" should stop.
+function lastEntryUuid(entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const uuid = getClaudeEntryUuid(entries[i]);
+    if (uuid) return uuid;
+  }
+  return null;
+}
+
+// Only the latest completed turn, exactly like the pre-cursor hook always sent. Used whenever
+// there is no usable cursor for this session — a brand new session's first Stop, or a cursor
+// entry the transcript no longer contains.
+function latestTurnOnly(entries) {
+  const turns = extractClaudeTurns(entries).map(turn => ({ ...turn, format: 'claude' }));
+  return turns.length > 0 ? [turns.at(-1)] : [];
+}
+
 function newTurnsSinceLastStore(entries, sessionId) {
   if (isPrimeTranscript(entries)) {
     const lastTurn = extractLastTurn(entries);
@@ -80,32 +98,26 @@ function newTurnsSinceLastStore(entries, sessionId) {
   }
 
   const previousCursor = readStopCursor(sessionId);
-  let sliceStart = 0;
   if (previousCursor) {
     const idx = entries.findIndex(entry => getClaudeEntryUuid(entry) === previousCursor.entryUuid);
-    if (idx === -1) {
-      // The cursor entry is gone from this transcript (e.g. compaction rewrote it). Reprocessing
-      // everything is the safe degrade — it can resend already-stored content, never lose it —
-      // but it must stay visible instead of silently falling back.
-      debug('cursor entry missing from transcript; reprocessing full transcript', previousCursor);
-    } else {
-      sliceStart = idx + 1;
+    if (idx !== -1) {
+      const slice = entries.slice(idx + 1);
+      const turns = extractClaudeTurns(slice).map(turn => ({ ...turn, format: 'claude' }));
+      return { turns, cursorEntryUuid: lastEntryUuid(slice) ?? previousCursor.entryUuid };
     }
+    // The cursor entry is gone from this transcript (e.g. compaction rewrote it). Reprocessing
+    // the transcript since its start would push this session's whole backlog through EverOS's
+    // boundary detection on a single Stop — a migration against a shared, quota-limited
+    // deployment, not a Stop hook. The safe degrade is the same rule as having no cursor at all:
+    // only the latest turn, never a backfill. Stays visible instead of silently falling back.
+    debug('cursor entry missing from transcript; sending only the latest turn, no backfill', previousCursor);
   }
 
-  const slice = entries.slice(sliceStart);
-  const turns = extractClaudeTurns(slice).map(turn => ({ ...turn, format: 'claude' }));
-
-  let cursorEntryUuid = previousCursor?.entryUuid ?? null;
-  for (let i = slice.length - 1; i >= 0; i--) {
-    const uuid = getClaudeEntryUuid(slice[i]);
-    if (uuid) {
-      cursorEntryUuid = uuid;
-      break;
-    }
-  }
-
-  return { turns, cursorEntryUuid };
+  // No usable cursor for this session yet. Sending everything since the transcript began would
+  // be the same migration-in-disguise described above, just on a session's very first Stop
+  // instead of a recovery. The first Stop of a session behaves exactly like every hook run did
+  // before this cursor existed: only the latest turn.
+  return { turns: latestTurnOnly(entries), cursorEntryUuid: lastEntryUuid(entries) };
 }
 
 async function main() {

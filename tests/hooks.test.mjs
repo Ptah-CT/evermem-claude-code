@@ -13,6 +13,7 @@ import {
   isMarkedTestTurn,
   parseTranscript,
 } from '../hooks/scripts/utils/transcript.js';
+import { writeStopCursor } from '../hooks/scripts/utils/stop-cursor.js';
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
@@ -238,16 +239,15 @@ test('store hook uses the canonical transcript even when a Prime message snapsho
     const primeResult = await runHook('store-memories.js', { transcript_path: primeFile, prime_messages: [], cwd: pluginRoot }, env);
     assert.match(primeResult.systemMessage, /Memory saved \(2\)/);
 
-    // claudeEntries has no prior cursor for this (new) session, so both of its completed turns
-    // — not just the last one — are new and get stored.
+    // claudeEntries has two completed turns and no prior cursor for this (new) session. A
+    // session's first Stop must never backfill — only the latest turn is new.
     const claudeFile = writeTranscript(directory, 'claude.jsonl', claudeEntries);
     const claudeResult = await runHook('store-memories.js', { transcript_path: claudeFile, cwd: pluginRoot }, env);
-    assert.match(claudeResult.systemMessage, /Memory saved \(4\)/);
+    assert.match(claudeResult.systemMessage, /Memory saved \(2\)/);
 
     const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
     assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), [
-      'Earlier Claude question', 'Earlier answer', 'Latest Claude answer', 'Latest Claude question',
-      'Prime assistant answer', 'Prime user question',
+      'Latest Claude answer', 'Latest Claude question', 'Prime assistant answer', 'Prime user question',
     ]);
   } finally {
     await fake.close();
@@ -296,6 +296,83 @@ test('store hook only resends what a session added since its last successful sto
     const thirdResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
     assert.match(thirdResult.systemMessage, /No new turns since last store/);
     assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories').length, 4);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook never backfills: with no cursor for N turns, only the latest is sent', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'no-backfill-session';
+
+    // A session whose FIRST-EVER Stop already sees three completed turns (e.g. several real
+    // exchanges happened before the hook could run, or without a turn_duration boundary between
+    // them). Sending everything since the transcript began would push this session's whole
+    // backlog through EverOS's boundary detection on a single Stop — a migration against a
+    // shared, quota-limited deployment, not a Stop hook. Only the newest turn may go out; the
+    // other two are never recovered, matching what the hook always sent before cursoring existed.
+    const entries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Turn one question' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn one answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td1', sessionId, timestamp: '2026-09-25T00:00:06.000Z' },
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:01:00.000Z', message: { role: 'user', content: 'Turn two question' } },
+      { type: 'assistant', uuid: 'a2', sessionId, timestamp: '2026-09-25T00:01:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn two answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td2', sessionId, timestamp: '2026-09-25T00:01:06.000Z' },
+      { type: 'user', uuid: 'u3', sessionId, timestamp: '2026-09-25T00:02:00.000Z', message: { role: 'user', content: 'Turn three question' } },
+      { type: 'assistant', uuid: 'a3', sessionId, timestamp: '2026-09-25T00:02:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Turn three answer' }] } },
+    ];
+    const transcript = writeTranscript(directory, 'no-backfill.jsonl', entries);
+    const result = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(result.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), [
+      'Turn three answer', 'Turn three question',
+    ]);
+
+    // The next Stop, with nothing new appended, must not resend anything — including not the
+    // two older turns that were never sent.
+    const secondResult = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(secondResult.systemMessage, /No new turns since last store/);
+    assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories').length, 2);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('store hook degrades to the latest turn only, never a backfill, when its cursor entry is gone from the transcript', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const env = {
+      EVERMEM_API_URL: fake.url, EVERMEM_DISABLE_PROJECT_SCOPE: '1', EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_STOP_CURSOR_FILE: join(directory, 'stop-cursors.jsonl'),
+    };
+    const sessionId = 'rewritten-transcript-session';
+
+    // Prime the cursor with an entry uuid that this transcript does not contain (e.g. the
+    // transcript was rewritten by compaction and no longer has the line the cursor points at).
+    writeStopCursor(sessionId, 'entry-that-no-longer-exists', join(directory, 'stop-cursors.jsonl'));
+
+    const entries = [
+      { type: 'user', uuid: 'u1', sessionId, timestamp: '2026-09-25T00:00:00.000Z', message: { role: 'user', content: 'Old question' } },
+      { type: 'assistant', uuid: 'a1', sessionId, timestamp: '2026-09-25T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Old answer' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'td1', sessionId, timestamp: '2026-09-25T00:00:06.000Z' },
+      { type: 'user', uuid: 'u2', sessionId, timestamp: '2026-09-25T00:01:00.000Z', message: { role: 'user', content: 'New question' } },
+      { type: 'assistant', uuid: 'a2', sessionId, timestamp: '2026-09-25T00:01:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'New answer' }] } },
+    ];
+    const transcript = writeTranscript(directory, 'rewritten.jsonl', entries);
+    const result = await runHook('store-memories.js', { transcript_path: transcript, session_id: sessionId, cwd: pluginRoot }, env);
+    assert.match(result.systemMessage, /Memory saved \(2\)/);
+
+    const stored = fake.requests.filter(request => request.path === '/api/v1/memories');
+    assert.deepEqual(stored.map(request => request.body.messages[0].content).sort(), ['New answer', 'New question']);
   } finally {
     await fake.close();
   }
