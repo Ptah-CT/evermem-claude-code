@@ -32,7 +32,7 @@ function writeTranscript(directory, name, entries) {
 async function runHook(script, payload, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(nodeBin, [join(pluginRoot, 'hooks/scripts', script)], {
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', EVERMEM_REQUEST_TIMEOUT_MS: '3600000', ...env },
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -363,15 +363,208 @@ test('session summaries preserve concurrent shutdown records', async () => {
 });
 
 
-test('hooks fail immediately when the deployment request deadline is invalid', async () => {
-  const result = await runHook('inject-memories.js', {
-    prompt: 'Configuration check prompt', cwd: pluginRoot,
+test('session end closes the accumulation window of the finished session', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const transcript = writeTranscript(directory, 'flush-claude.jsonl', claudeEntries);
+    const result = await runHook('session-summary.js', {
+      session_id: 'flush-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    });
+
+    assert.match(result.systemMessage, /Memory window closed/);
+    const flushes = fake.requests.filter(request => request.path === '/api/v1/memories/flush');
+    assert.equal(flushes.length, 1);
+    assert.deepEqual(flushes[0].body, { user_id: 'fixture-user', session_id: 'flush-session' });
+    assert.equal(flushes[0].method, 'POST');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('session end flushes the group window when a group is configured', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const transcript = writeTranscript(directory, 'flush-group.jsonl', claudeEntries);
+    await runHook('session-summary.js', {
+      session_id: 'group-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_GROUP_ID: 'fixture-group',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    });
+
+    const flushes = fake.requests.filter(request => request.path === '/api/v1/memories/group/flush');
+    assert.equal(flushes.length, 1);
+    assert.deepEqual(flushes[0].body, { group_id: 'fixture-group' });
+    assert.equal(fake.requests.filter(request => request.path === '/api/v1/memories/flush').length, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a failed window flush is reported in-band and still keeps the summary', async () => {
+  const directory = makeTempDir();
+  const sessionsFile = join(directory, 'sessions.jsonl');
+  const transcript = writeTranscript(directory, 'flush-fail.jsonl', claudeEntries);
+
+  const result = await runHook('session-summary.js', {
+    session_id: 'unreachable-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
   }, {
     EVERMEM_API_URL: 'http://127.0.0.1:1',
+    EVERMEM_DISABLE_PROJECT_SCOPE: '1',
     EVERMEM_USER_ID: 'fixture-user',
-    EVERMEM_REQUEST_TIMEOUT_MS: 'not-a-number',
+    EVERMEM_SESSIONS_FILE: sessionsFile,
   });
-  assert.match(result.systemMessage, /positive integer/);
+
+  assert.match(result.systemMessage, /Window flush failed/);
+  assert.match(result.systemMessage, /unreachable-session/);
+  const saved = JSON.parse(readFileSync(sessionsFile, 'utf8').trim());
+  assert.equal(saved.sessionId, 'unreachable-session');
+});
+
+test('skipped sessions do not flush a window they never filled', async () => {
+  const fake = await startFakeEvermem();
+  const directory = makeTempDir();
+  try {
+    const testEntries = structuredClone(claudeEntries);
+    testEntries[0].message.content = '[TEST-FLUSH-20260810T160000Z] probe';
+    const transcript = writeTranscript(directory, 'flush-skip.jsonl', testEntries);
+    const env = {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+      EVERMEM_SESSIONS_FILE: join(directory, 'sessions.jsonl'),
+    };
+
+    const marked = await runHook('session-summary.js', {
+      session_id: 'marked-session', transcript_path: transcript, cwd: pluginRoot, reason: 'quit',
+    }, env);
+    assert.match(marked.systemMessage, /Test session detected/);
+
+    const empty = writeTranscript(directory, 'flush-empty.jsonl', [
+      { type: 'assistant', timestamp: '2026-08-08T09:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'no user turn' }] } },
+    ]);
+    const noTurns = await runHook('session-summary.js', {
+      session_id: 'empty-session', transcript_path: empty, cwd: pluginRoot, reason: 'quit',
+    }, env);
+    assert.match(noTurns.systemMessage, /no user turns/);
+
+    assert.equal(fake.requests.filter(request => request.path.includes('flush')).length, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+// HIER STAND 'hooks fail immediately when the deployment request deadline is
+// invalid'. Der Vertrag, den er geprüft hat, gibt es nicht mehr: Auf diesem
+// Pfad existiert keine Frist, also auch kein Schlüssel, der ungültig sein
+// könnte. Ein Test, der ein entferntes Verhalten festhält, hielte es am Leben.
+//
+// AN SEINE STELLE TRITT KEIN ERSATZ FÜR DEN KONFIGURATIONSFALL, und der Grund
+// ist selbst ein Befund. Ein erster Versuch prüfte „fehlt Ziel oder Kennung,
+// scheitert der Hook sofort" — und schlug fehl, weil er nicht prüfen KANN, was
+// er prüfen wollte:
+//
+// `config.js` lädt die `.env` des Plugin-Wurzelverzeichnisses und setzt jeden
+// Schlüssel, dessen Wert in der Umgebung falsy ist (`if (!process.env[key])`).
+// Ein von aussen übergebenes `EVERMEM_API_URL=''` ist falsy — also gewinnt die
+// `.env`, und der Hook lief mit der ECHTEN Adresse los, statt zu scheitern.
+// (Er hat dabei eine echte Suche gegen den laufenden Dienst gefahren: ein
+// Lesezugriff, aber ein Prod-Zugriff aus einem Test heraus.)
+//
+// Damit ist `isConfigured()` in dieser Installation von aussen nicht auf
+// `false` zu bringen, solange die `.env` existiert — ein Test dafür wäre eine
+// Zusage, die er nicht einlöst. Lieber keiner als einer, der grün wird, weil
+// er etwas anderes misst.
+
+// DER ABRUFHOOK WAR VON KEINEM TEST BERÜHRT, und das ist am 2026-09-09 teuer
+// geworden. `inject-memories.js` kam in dieser Datei GAR NICHT vor — der
+// einzige Test, der ihn je gestartet hatte, war der oben entfernte, und er
+// prüfte etwas ganz anderes (die Fristvalidierung). Als ich beim Umbau in
+// `config.js` eine Funktion entfernte und ihren Aufrufer einen Schritt später,
+// brach der Abruf im Betrieb mit `ReferenceError: getRequestTimeoutMs is not
+// defined` — nach 0,0 s, also beim Laden. Die Testreihe stand zu diesem
+// Zeitpunkt auf 16/16 grün.
+//
+// Deshalb steht hier jetzt eine Rauchprobe: Sie startet den echten Hook als
+// eigenen Prozess gegen die Attrappe und prüft, dass er lädt, sucht und ein
+// wohlgeformtes Ergebnis liefert. Sie fängt keinen Logikfehler — sie fängt
+// genau die Klasse, die hier zugeschlagen hat: eine Datei, die sich nicht mehr
+// laden lässt.
+test('the recall hook loads, searches and returns a well-formed result', async () => {
+  const fake = await startFakeEvermem();
+  try {
+    const result = await runHook('inject-memories.js', {
+      prompt: 'a prompt with enough words to pass the minimum', cwd: pluginRoot,
+    }, {
+      EVERMEM_API_URL: fake.url,
+      EVERMEM_DISABLE_PROJECT_SCOPE: '1',
+      EVERMEM_USER_ID: 'fixture-user',
+    });
+
+    assert.ok(result, 'Der Abrufhook hat gar nichts ausgegeben — das ist der Ladefehler.');
+    assert.doesNotMatch(result.systemMessage, /recall FAILED/,
+      `Der Abruf meldete einen Fehler: ${result.systemMessage}`);
+    assert.match(result.systemMessage, /Memory Retrieved/);
+    assert.match(
+      result.hookSpecificOutput.additionalContext,
+      /Relevant memory for the current prompt/,
+    );
+
+    const suchen = fake.requests.filter(r => r.path === '/api/v1/memories/search');
+    assert.equal(suchen.length, 1);
+    assert.deepEqual(suchen[0].body.filters, { user_id: 'fixture-user' });
+  } finally {
+    await fake.close();
+  }
+});
+
+// Eine Frist auf diesem Pfad ist ein Rückfall, kein Detail — deshalb wird sie
+// geprüft und nicht dem guten Willen überlassen. Der Server nimmt an, liest
+// und antwortet nie; die alte kleinste Bibliotheksfrist lag bei 300.760 ms.
+// Läuft der Aufruf sichtbar darüber hinaus, gibt es keine mehr.
+//
+// Gefahren wird knapp jenseits der alten Grenze statt Minuten darüber: Der
+// Testlauf soll den Befund tragen, nicht die Wanduhr. Die volle Messung
+// (330.035 ms Kopfzeilen, 330.011 ms Rumpf, beide ohne Abbruch) steht in
+// ewm#167.
+test('no client-side deadline cuts a slow response short', { timeout: 340000 }, async () => {
+  const stiller = createServer((req, res) => { req.resume(); });
+  await new Promise(fertig => stiller.listen(0, '127.0.0.1', fertig));
+  const port = stiller.address().port;
+
+  const modul = await import(
+    `${pathToFileURL(join(pluginRoot, 'hooks/scripts/utils/evermem-api.js')).href}?ohne-frist=${Date.now()}`
+  );
+  process.env.EVERMEM_API_URL = `http://127.0.0.1:${port}`;
+  process.env.EVERMEM_USER_ID = 'fixture-user';
+  process.env.EVERMEM_DISABLE_PROJECT_SCOPE = '1';
+
+  const begonnen = Date.now();
+  const lauf = modul.addMemory({
+    content: 'probe', role: 'user', sessionId: 'no-deadline', timestamp: Date.now(),
+  });
+
+  const dauer = 310000;
+  const nochOffen = await Promise.race([
+    lauf.then(() => 'beendet'),
+    new Promise(fertig => setTimeout(() => fertig('offen'), dauer)),
+  ]);
+
+  assert.equal(nochOffen, 'offen',
+    `Der Aufruf endete nach ${Date.now() - begonnen} ms — es gibt wieder eine Frist.`);
+
+  stiller.closeAllConnections();
+  stiller.close();
+  await lauf;
 });
 
 test('Prime lifecycle cancellation terminates an EverMem subprocess loudly', async () => {

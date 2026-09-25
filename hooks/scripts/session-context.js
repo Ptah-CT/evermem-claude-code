@@ -28,7 +28,7 @@ if (major < 18) {
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getMemories, transformGetMemoriesResults } from './utils/evermem-api.js';
+import { beschreibtFehler, getMemories, transformGetMemoriesResults } from './utils/evermem-api.js';
 import { getConfig, getGroupId } from './utils/config.js';
 import { saveGroup } from './utils/groups-store.js';
 
@@ -207,10 +207,17 @@ async function main() {
     // Don't block session start on errors, but always say what broke.
     // Provide user-friendly error messages
     let userMessage = '⚠️ EverMem: ';
-    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-      userMessage += `Network error - cannot reach the configured EverMem endpoint.`;
-    } else if (error.code === 'ETIMEDOUT' || error.name === 'TimeoutError') {
-      userMessage += `Request timeout - EverMem server is slow or unreachable.`;
+    // HIER STAND `error.code === 'ECONNREFUSED'` UND HAT NIE GEGRIFFEN.
+    // `getMemories` ruft `fetch`; ein Transportfehler kommt als
+    // `TypeError: fetch failed` mit `code === undefined` an — der Code sitzt
+    // in `error.cause`. Beide Netz-Zweige waren damit unerreichbar, und jeder
+    // Ausfall fiel in den Sammelzweig unten: "TypeError: fetch failed".
+    // Deshalb wird die Ursachenkette abgelaufen, statt eine Ebene zu prüfen.
+    const ursachen = beschreibtFehler(error);
+    if (/\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)\b/.test(ursachen)) {
+      userMessage += `Network error - cannot reach the configured EverMem endpoint. ${ursachen}`;
+    } else if (/\bETIMEDOUT\b/.test(ursachen) || error.name === 'TimeoutError') {
+      userMessage += `Request timeout - EverMem server is slow or unreachable. ${ursachen}`;
     } else if (error.message?.includes('401') || error.message?.includes('Unauthorized')) {
       userMessage += `Authentication failed. Check your EVERMEM_API_KEY in .env file.`;
     } else if (error.message?.includes('404')) {
@@ -218,7 +225,7 @@ async function main() {
     } else if (error.message?.includes('ENOENT')) {
       userMessage += `File not found: ${error.path || 'unknown'}`;
     } else {
-      userMessage += `${error.name}: ${error.message}`;
+      userMessage += ursachen;
     }
 
     console.log(JSON.stringify({

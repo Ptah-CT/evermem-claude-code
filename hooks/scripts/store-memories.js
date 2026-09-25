@@ -44,12 +44,56 @@ function writeMessage(systemMessage) {
   process.stdout.write(JSON.stringify({ systemMessage }));
 }
 
-function truncateBody(body) {
-  if (!body) return body;
+/** Wie viel vom Nachrichtenkörper eine Fehlermeldung zeigt. */
+const KOERPER_GRENZE = 500;
+
+/**
+ * Kürzt den Nachrichtenkörper einer gescheiterten Anfrage — DORT, WO DER TEXT
+ * WIRKLICH LIEGT.
+ *
+ * HIER STAND EINE SCHERE, DIE NIE GESCHNITTEN HAT. Die alte Fassung prüfte
+ * `body.content`; die Nutzlast dieses Endpunkts trägt den Text aber in
+ * `body.messages[].content`. Das Feld `body.content` gibt es nicht und hat es
+ * nie gegeben, also griff die Kürzung auf KEINER Nutzlast, und jede
+ * Fehlermeldung trug die vollständige Nachricht wortwörtlich ins Transkript.
+ *
+ * GEMESSEN am 2026-09-09, echter Ende-zu-Ende-Lauf mit dem Transkript dieser
+ * Sitzung: die erzeugte `systemMessage` war **527 KB** groß (Nutzer 306.506 +
+ * Assistent 183.181 Zeichen). Sie ist in einer laufenden Sitzung angekommen
+ * und hat dort den Kontext verdrängt, der für die Arbeit gebraucht wurde. Ein
+ * Alarm, der so groß ist, dass er seinen Leser verdrängt, ist kein Alarm.
+ *
+ * DIESELBE KLASSE wie der `error.code`-Zweig in `session-context.js`, am
+ * selben Abend gefunden: eine Vorrichtung, die an einem angenommenen Feld
+ * hängt und nie gegen die echte Form gefahren wurde.
+ *
+ * DIE KÜRZUNG SAGT SICH AN. Eine stille Kürzung wäre wieder eine Vorrichtung,
+ * die schweigt — der Leser muss sehen, dass er einen Ausschnitt liest, und um
+ * wie viel er gekürzt ist.
+ *
+ * WAS HIER NICHT GEKÜRZT WIRD: die Fehlerursache. Sie steht in `response`,
+ * nicht im Körper, und wird von dieser Funktion nicht angefasst — siehe die
+ * Reihenfolge der Ausgabe in `main()`.
+ *
+ * @param {Object} body - Die gesendete Nutzlast
+ * @returns {Object} Eine Kopie; Originale werden nicht verändert
+ */
+function kuerztKoerper(body) {
+  if (!body || typeof body !== 'object') return body;
   const copy = { ...body };
-  if (copy.content && typeof copy.content === 'string' && copy.content.length > 100) {
-    copy.content = copy.content.substring(0, 100) + '... [truncated]';
-  }
+  if (!Array.isArray(copy.messages)) return copy;
+
+  copy.messages = copy.messages.map(message => {
+    if (!message || typeof message.content !== 'string') return message;
+    const laenge = message.content.length;
+    if (laenge <= KOERPER_GRENZE) return message;
+    const fehlend = laenge - KOERPER_GRENZE;
+    return {
+      ...message,
+      content: `${message.content.slice(0, KOERPER_GRENZE)}`
+        + `… [gekürzt: ${fehlend} von ${laenge} Zeichen nicht gezeigt]`,
+    };
+  });
   return copy;
 }
 
@@ -150,9 +194,15 @@ async function main() {
     if (result.error) {
       output += `${result.type}: ERROR - ${result.error}\n`;
     } else if (!result.ok) {
+      // URSACHE ZUERST, KÖRPER DANACH — und das ist keine Kosmetik.
+      // Der ganze Sinn von `beschreibtFehler` ist, dass `ECONNREFUSED` samt
+      // Adresse und Port ankommt. Stünde die Antwort hinter einem 500-KB-Rumpf,
+      // wäre sie genau das, was ein Leser (Mensch wie Modell) nicht mehr
+      // erreicht — der Defekt wäre einmal behoben und einmal wieder eingesetzt.
+      // Was weichen darf, ist der Nachrichtenkörper; die Ursache nie.
       output += `${result.type}: FAILED (${result.status})\n`;
-      output += `Request: ${JSON.stringify(truncateBody(result.body), null, 2)}\n`;
       output += `Response: ${JSON.stringify(result.response, null, 2)}\n`;
+      output += `Request: ${JSON.stringify(kuerztKoerper(result.body), null, 2)}\n`;
     }
   }
   if (skipped.length > 0) {
